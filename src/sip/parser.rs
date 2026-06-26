@@ -636,14 +636,15 @@ pub fn extract_uri_from_header(msg: &str, header_name: &str) -> Option<String> {
     None
 }
 
-/// 修改 SDP 中的媒体地址和端口
+/// 修改 SDP 中的媒体地址和端口，并注入指定的 SDES crypto key
 ///
 /// 将 SDP 中的 c= 行替换为服务器中继地址，
-/// 将 m=audio 行的端口替换为中继端口。
-/// 其余媒体参数（RTP/SRTP 协议、crypto、fingerprint 等）保持不变，
-/// 由两端客户端直接协商，服务器只做媒体地址中继。
-pub fn rewrite_sdp(sdp: &str, relay_addr: &str, relay_port: u16, _crypto_key_b64: &str) -> String {
+/// 将 m=audio 行的端口替换为中继端口，并将 RTP/AVP 规范化为 RTP/SAVP。
+/// 服务器作为媒体 B2BUA，每一侧使用独立的 SDES 密钥。
+pub fn rewrite_sdp(sdp: &str, relay_addr: &str, relay_port: u16, crypto_key_b64: &str) -> String {
     let mut result = Vec::new();
+    let mut found_media = false;
+    let mut crypto_inserted = false;
 
     for line in sdp.lines() {
         if line.starts_with("c=") {
@@ -654,7 +655,11 @@ pub fn rewrite_sdp(sdp: &str, relay_addr: &str, relay_port: u16, _crypto_key_b64
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 4 {
                 // m=audio <port> <proto> <formats...>
-                let proto = parts[2];
+                let proto = if parts[2].contains("SAVP") {
+                    parts[2].to_string()
+                } else {
+                    parts[2].replace("AVP", "SAVP")
+                };
                 let formats: Vec<&str> = parts[3..].to_vec();
                 result.push(format!(
                     "m=audio {} {} {}",
@@ -662,12 +667,30 @@ pub fn rewrite_sdp(sdp: &str, relay_addr: &str, relay_port: u16, _crypto_key_b64
                     proto,
                     formats.join(" ")
                 ));
+                found_media = true;
             } else {
                 result.push(line.to_string());
             }
         } else {
+            if found_media && !crypto_inserted && !line.starts_with("m=") {
+                if line.starts_with("a=crypto") {
+                    result.push(format!(
+                        "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{}",
+                        crypto_key_b64
+                    ));
+                    crypto_inserted = true;
+                    continue;
+                }
+            }
             result.push(line.to_string());
         }
+    }
+
+    if found_media && !crypto_inserted {
+        result.push(format!(
+            "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{}",
+            crypto_key_b64
+        ));
     }
 
     result.join("\r\n")
@@ -797,7 +820,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_sdp_preserves_media_security_params() {
+    fn test_rewrite_sdp_normalizes_srtp_and_replaces_crypto() {
         let sdp = concat!(
             "v=0\r\n",
             "o=- 1 1 IN IP4 192.168.1.10\r\n",
@@ -809,8 +832,8 @@ mod tests {
         let rewritten = rewrite_sdp(sdp, "203.0.113.10", 20000, "SERVERKEY");
 
         assert!(rewritten.contains("c=IN IP4 203.0.113.10"));
-        assert!(rewritten.contains("m=audio 20000 RTP/AVP 0 8 101"));
-        assert!(rewritten.contains("a=crypto:2 AES_CM_128_HMAC_SHA1_80 inline:CLIENTKEY"));
-        assert!(!rewritten.contains("SERVERKEY"));
+        assert!(rewritten.contains("m=audio 20000 RTP/SAVP 0 8 101"));
+        assert!(rewritten.contains("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:SERVERKEY"));
+        assert!(!rewritten.contains("CLIENTKEY"));
     }
 }

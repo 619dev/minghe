@@ -102,6 +102,18 @@ impl AppConfig {
             return Err("RTP 端口起始必须为偶数（RTP 使用偶数端口，RTCP 使用奇数端口）".into());
         }
 
+        if config.media.media_addr.trim().is_empty() {
+            return Err("media_addr 不能为空。请填写客户端可访问的服务器公网或内网 IP，否则接听后可能无声。".into());
+        }
+
+        if config.media.media_addr.parse::<std::net::IpAddr>().is_err() {
+            return Err(format!(
+                "media_addr '{}' 不是有效 IP。请填写 Bria、Linkvil 等客户端可访问的公网或内网 IP。",
+                config.media.media_addr
+            )
+            .into());
+        }
+
         // 校验独立密码中的分机号是否在范围内
         for (ext_str, _) in &config.passwords {
             if let Ok(ext_num) = ext_str.parse::<u32>() {

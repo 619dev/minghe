@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use super::parser;
 use super::registrar::RegistrarService;
 use crate::media::relay::MediaRelayManager;
-use crate::media::srtp::SrtpCryptoSuite;
+use crate::media::srtp::{parse_crypto_attribute, SrtpCryptoSuite};
 
 /// 呼叫状态
 #[derive(Debug, Clone, PartialEq)]
@@ -46,10 +46,14 @@ pub struct CallInfo {
     pub caller_writer: mpsc::Sender<Vec<u8>>,
     /// 被叫侧写入通道
     pub callee_writer: Option<mpsc::Sender<Vec<u8>>>,
-    /// 主叫侧 SRTP 密钥（保留给兼容旧接口，透明中继模式不使用）
-    pub caller_crypto: SrtpCryptoSuite,
-    /// 被叫侧 SRTP 密钥（保留给兼容旧接口，透明中继模式不使用）
-    pub callee_crypto: SrtpCryptoSuite,
+    /// 主叫原始 offer 中的 SRTP 密钥（用于解密主叫发来的媒体）
+    pub caller_remote_crypto: SrtpCryptoSuite,
+    /// 服务端转发给主叫的 answer 密钥（用于加密发给主叫的媒体）
+    pub caller_local_crypto: SrtpCryptoSuite,
+    /// 被叫 answer 中的 SRTP 密钥（用于解密被叫发来的媒体）
+    pub callee_remote_crypto: Option<SrtpCryptoSuite>,
+    /// 服务端转发给被叫的 offer 密钥（用于加密发给被叫的媒体）
+    pub callee_local_crypto: SrtpCryptoSuite,
     /// 主叫侧中继端口
     pub caller_relay_port: u16,
     /// 被叫侧中继端口
@@ -182,14 +186,27 @@ impl Router {
             }
         };
 
-        // 生成两侧的 SRTP 密钥
-        let caller_crypto = SrtpCryptoSuite::new();
-        let callee_crypto = SrtpCryptoSuite::new();
+        let caller_remote_crypto = match parser::extract_body(request_text)
+            .as_deref()
+            .and_then(extract_srtp_crypto_from_sdp)
+        {
+            Some(crypto) => crypto,
+            None => {
+                tracing::warn!(
+                    "主叫 {} 的 INVITE 缺少可用 a=crypto，无法建立 SRTP 媒体",
+                    caller_ext
+                );
+                return parser::build_response(request_text, 488, "Not Acceptable Here");
+            }
+        };
+
+        // 生成服务端分别向主叫、被叫声明的 SRTP 密钥
+        let caller_local_crypto = SrtpCryptoSuite::new();
+        let callee_local_crypto = SrtpCryptoSuite::new();
 
         // 修改 SDP：替换媒体地址和端口，保留原始 RTP/SRTP 参数
         let callee_invite = if let Some(body) = parser::extract_body(request_text) {
-            // 透明中继模式下不替换 crypto key，仅为兼容函数签名保留参数。
-            let callee_sdes = callee_crypto.to_sdes_attribute();
+            let callee_sdes = callee_local_crypto.to_sdes_attribute();
             let callee_key = callee_sdes.split("inline:").nth(1).unwrap_or_default();
 
             let new_sdp = parser::rewrite_sdp(
@@ -217,20 +234,19 @@ impl Router {
             original_invite: request_text.to_string(),
             caller_writer: caller_writer.clone(),
             callee_writer: Some(callee_writer.clone()),
-            caller_crypto,
-            callee_crypto,
+            caller_remote_crypto,
+            caller_local_crypto,
+            callee_remote_crypto: None,
+            callee_local_crypto,
             caller_relay_port: relay_session.caller_port,
             callee_relay_port: relay_session.callee_port,
-            relay_started: true,
+            relay_started: false,
         };
 
         {
             let mut calls = self.active_calls.write().unwrap();
             calls.insert(call_id.clone(), call_info);
         }
-
-        // 提前启动 UDP 媒体中继，确保被叫收到 SDP 后端口已经开始监听。
-        self.start_media_relay(&call_id).await;
 
         // 转发 INVITE 到被叫
         if let Err(e) = callee_writer.send(callee_invite).await {
@@ -294,6 +310,19 @@ impl Router {
                     if call.callee_tag.is_none() {
                         call.callee_tag = parser::extract_to_tag(response_text);
                     }
+                    if call.callee_remote_crypto.is_none() {
+                        if let Some(crypto) = parser::extract_body(response_text)
+                            .as_deref()
+                            .and_then(extract_srtp_crypto_from_sdp)
+                        {
+                            call.callee_remote_crypto = Some(crypto);
+                        } else {
+                            tracing::warn!(
+                                "被叫 200 OK 缺少可用 a=crypto，无法启动媒体中继: Call-ID={}",
+                                call_id
+                            );
+                        }
+                    }
                 }
                 n if n >= 400 => {
                     call.state = CallState::Terminated;
@@ -315,7 +344,7 @@ impl Router {
             let caller_key = {
                 let calls = self.active_calls.read().unwrap();
                 if let Some(call) = calls.get(&call_id) {
-                    let sdes = call.caller_crypto.to_sdes_attribute();
+                    let sdes = call.caller_local_crypto.to_sdes_attribute();
                     sdes.split("inline:").nth(1).unwrap_or_default().to_string()
                 } else {
                     String::new()
@@ -381,7 +410,7 @@ impl Router {
             let should_start = {
                 let mut calls = self.active_calls.write().unwrap();
                 if let Some(call) = calls.get_mut(&call_id) {
-                    if !call.relay_started {
+                    if !call.relay_started && call.callee_remote_crypto.is_some() {
                         call.relay_started = true;
                         true
                     } else {
@@ -394,7 +423,12 @@ impl Router {
             if should_start {
                 self.start_media_relay(&call_id).await;
             } else {
-                tracing::debug!("媒体中继已在运行，跳过重复启动: Call-ID={}", call_id);
+                let calls = self.active_calls.read().unwrap();
+                if let Some(call) = calls.get(&call_id) {
+                    if call.callee_remote_crypto.is_none() {
+                        tracing::warn!("媒体中继未启动：缺少被叫 SRTP crypto (Call-ID={})", call_id);
+                    }
+                }
             }
         }
     }
@@ -565,7 +599,7 @@ impl Router {
         let calls = self.active_calls.read().unwrap();
         if let Some(call) = calls.get(call_id) {
             tracing::info!(
-                "启动 RTP/SRTP 透明媒体中继: Call-ID={}, 主叫端口={}, 被叫端口={}",
+                "启动 SRTP B2BUA 媒体中继: Call-ID={}, 主叫端口={}, 被叫端口={}",
                 call_id,
                 call.caller_relay_port,
                 call.callee_relay_port
@@ -576,8 +610,16 @@ impl Router {
             let callee_port = call.callee_relay_port;
             let media_addr = self.media_addr.clone();
             let call_id_clone = call_id.to_string();
-            let caller_crypto = call.caller_crypto.clone();
-            let callee_crypto = call.callee_crypto.clone();
+            let caller_decrypt_crypto = call.caller_remote_crypto.clone();
+            let callee_encrypt_crypto = call.callee_local_crypto.clone();
+            let callee_decrypt_crypto = match &call.callee_remote_crypto {
+                Some(crypto) => crypto.clone(),
+                None => {
+                    tracing::warn!("无法启动媒体中继：缺少被叫 SRTP crypto (Call-ID={})", call_id);
+                    return;
+                }
+            };
+            let caller_encrypt_crypto = call.caller_local_crypto.clone();
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
             self.media_manager.register_shutdown(call_id, shutdown_tx);
 
@@ -587,8 +629,10 @@ impl Router {
                     &media_addr,
                     caller_port,
                     callee_port,
-                    caller_crypto,
-                    callee_crypto,
+                    caller_decrypt_crypto,
+                    callee_encrypt_crypto,
+                    callee_decrypt_crypto,
+                    caller_encrypt_crypto,
                     shutdown_rx,
                 )
                 .await
@@ -656,4 +700,21 @@ fn rebuild_request_with_sdp(request: &str, new_sdp: &str, _domain: &str) -> Vec<
 /// 重建带有新 SDP 的 SIP 响应
 fn rebuild_response_with_sdp(response: &str, new_sdp: &str) -> Vec<u8> {
     rebuild_request_with_sdp(response, new_sdp, "")
+}
+
+fn extract_srtp_crypto_from_sdp(sdp: &str) -> Option<SrtpCryptoSuite> {
+    for line in sdp.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("a=crypto") || trimmed.starts_with("crypto:") {
+            match parse_crypto_attribute(trimmed)
+                .and_then(|(_, _, key)| SrtpCryptoSuite::from_sdes(&key))
+            {
+                Ok(crypto) => return Some(crypto),
+                Err(e) => {
+                    tracing::warn!("无法解析 SDP crypto 行 '{}': {}", trimmed, e);
+                }
+            }
+        }
+    }
+    None
 }
