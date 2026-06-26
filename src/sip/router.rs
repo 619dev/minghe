@@ -54,6 +54,8 @@ pub struct CallInfo {
     pub caller_relay_port: u16,
     /// 被叫侧中继端口
     pub callee_relay_port: u16,
+    /// 媒体中继是否已启动
+    pub relay_started: bool,
 }
 
 /// 呼叫路由器
@@ -144,6 +146,15 @@ impl Router {
             caller_ext, callee_ext, call_id
         );
 
+        // 检查是否为 INVITE 重传（同一 Call-ID 已在处理中）
+        {
+            let calls = self.active_calls.read().unwrap();
+            if calls.contains_key(&call_id) {
+                tracing::debug!("INVITE 重传，忽略: Call-ID={}", call_id);
+                return parser::build_response(request_text, 100, "Trying");
+            }
+        }
+
         // 检查被叫是否在线
         if !self.registrar.is_registered(&callee_ext) {
             tracing::warn!("被叫 {} 不在线", callee_ext);
@@ -210,6 +221,7 @@ impl Router {
             callee_crypto,
             caller_relay_port: relay_session.caller_port,
             callee_relay_port: relay_session.callee_port,
+            relay_started: false,
         };
 
         {
@@ -272,8 +284,10 @@ impl Router {
                     }
                 }
                 200 => {
-                    call.state = CallState::Established;
-                    tracing::info!("呼叫 {} 已建立", call_id);
+                    if call.state != CallState::Established {
+                        call.state = CallState::Established;
+                        tracing::info!("呼叫 {} 已建立", call_id);
+                    }
                     if call.callee_tag.is_none() {
                         call.callee_tag = parser::extract_to_tag(response_text);
                     }
@@ -372,9 +386,26 @@ impl Router {
             self.cleanup_call(&call_id);
         }
 
-        // 如果是 200 OK，启动媒体中继
+        // 如果是 200 OK，且中继尚未启动，启动媒体中继
         if status_code == 200 {
-            self.start_media_relay(&call_id).await;
+            let should_start = {
+                let mut calls = self.active_calls.write().unwrap();
+                if let Some(call) = calls.get_mut(&call_id) {
+                    if !call.relay_started {
+                        call.relay_started = true;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+            if should_start {
+                self.start_media_relay(&call_id).await;
+            } else {
+                tracing::debug!("媒体中继已在运行，跳过重复启动: Call-ID={}", call_id);
+            }
         }
     }
 
