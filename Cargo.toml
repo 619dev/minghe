@@ -1,0 +1,47 @@
+[package]
+name = "minghe"
+version = "0.1.0"
+edition = "2021"
+description = "鸣鹤 — 最小化安全 SIP 语音通信服务"
+license = "Apache-2.0"
+authors = ["MingHe Contributors"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# SIP parsing
+rsip = "0.4"
+anyhow = "1"
+
+# TLS
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+rcgen = { version = "0.13", features = ["default"] }
+time = "0.3"
+
+# Crypto for SRTP & Digest auth
+aes = "0.8"
+ctr = "0.9"
+hmac = "0.12"
+sha1 = "0.10"
+md-5 = "0.10"
+rand = "0.8"
+base64 = "0.22"
+hex = "0.4"
+
+# Serialization & config
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Utilities
+bytes = "1"
+uuid = { version = "1", features = ["v4"] }

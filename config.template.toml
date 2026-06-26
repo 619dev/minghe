@@ -1,0 +1,77 @@
+# ============================================================
+# 鸣鹤 (MingHe) SIP Server — 配置模板
+# ============================================================
+#
+# 使用前请复制此文件到 config/ 目录:
+#   cp config.template.toml config/config.toml
+#
+# 然后根据实际环境修改配置值。
+# 带 [必填] 标记的项必须根据实际情况修改。
+# ============================================================
+
+[server]
+# 监听地址（容器内建议保持 0.0.0.0）
+listen_addr = "0.0.0.0"
+
+# SIP TLS 端口 (SIPS 标准端口)
+sip_port = 5061
+
+# [必填] 服务器域名或 IP 地址
+# 用于 SIP URI、TLS 证书生成和 Digest 认证的 realm
+# 示例:
+#   域名模式: host = "sip.example.com"
+#   IP 模式:  host = "192.168.1.100"
+host = "minghe.local"
+
+[extensions]
+# 分机号码范围（含起止）
+range_start = 1000
+range_end = 2000
+
+# [必填] 所有分机的默认密码
+# 未在 [passwords] 中单独配置的分机使用此密码
+# ⚠️ 请务必修改为强密码！
+default_password = "CHANGE_ME_TO_A_STRONG_PASSWORD"
+
+[tls]
+# TLS 证书路径
+# 留空 = 自动生成自签名证书（推荐内网使用）
+# 指定路径 = 使用外部证书（推荐生产环境）
+#
+# 自签名证书模式:
+#   cert_path = ""
+#   key_path = ""
+#   证书将自动生成到 certs/ 目录，并在到期前 30 天自动续期
+#
+# 外部证书模式:
+#   cert_path = "/app/certs/fullchain.pem"
+#   key_path = "/app/certs/privkey.pem"
+#   请自行管理证书更新（如使用 certbot）
+cert_path = ""
+key_path = ""
+
+[media]
+# RTP 中继端口范围
+# 每通通话占用 2 个 UDP 端口（主叫侧 + 被叫侧）
+# 端口数量 = (rtp_port_end - rtp_port_start) / 2 = 最大并发通话数
+rtp_port_start = 20000
+rtp_port_end = 30000
+
+# [必填] 服务器公网/内网 IP（用于 SDP 中的媒体地址）
+# 此地址必须是客户端可达的 IP
+# 留空 = 自动检测本机出口 IP（适用于单网卡环境）
+# Docker 环境建议填写宿主机 IP
+media_addr = ""
+
+# ============================================================
+# 分机独立密码（可选）
+# ============================================================
+# 为特定分机设置独立密码，覆盖 default_password
+# 格式: 分机号 = "密码"
+# 未列出的分机使用上方 default_password
+#
+# 示例:
+[passwords]
+# 1001 = "velox@2026"
+# 1002 = "alice@2026"
+# 1003 = "bob@2026"

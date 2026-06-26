@@ -1,0 +1,144 @@
+apiVersion: zeabur.com/v1
+kind: Template
+metadata:
+  name: MingHe-SIP
+spec:
+  description: "MingHe (鸣鹤) — Minimal Secure SIP Voice Communication Server. Pure Rust, TLS signaling encryption, SRTP media encryption, SIP Digest authentication."
+  tags:
+    - VoIP
+    - SIP
+    - Rust
+    - Communication
+    - TLS
+  readme: |-
+    # 鸣鹤 (MingHe) SIP Server
+
+    最小化安全 SIP 语音通信服务器，纯 Rust 编写。
+
+    ## 特性
+
+    - 🔒 TLS 信令加密 (SIPS, TLS 1.2/1.3)
+    - 🎵 SRTP 媒体流加密 (AES_CM_128_HMAC_SHA1_80)
+    - 🔑 SIP Digest 认证 (支持独立密码)
+    - 📡 RTP 媒体中继 (透明转发)
+    - 📱 内部分机 1000–2000 (可配置)
+    - 🌐 支持 IP 证书和域名证书
+    - 🔄 自签名证书自动续期
+
+    ## 部署后配置
+
+    1. 部署完成后，在 Zeabur 控制台的 **Configs** 中编辑 `/app/config/config.toml`
+    2. 将 `host` 修改为你的服务器 IP 或域名
+    3. 修改 `default_password` 为强密码
+    4. 如需独立密码，在 `[passwords]` 段中添加
+    5. 重启服务使配置生效
+
+    ## 客户端连接
+
+    | 配置项 | 值 |
+    |:------|:----|
+    | 服务器 | 你的 Zeabur 转发地址 |
+    | 端口 | 5061 |
+    | 传输 | TLS |
+    | 用户名 | 分机号 (如 1001) |
+    | 密码 | 你设置的密码 |
+
+    > ⚠️ 自签名证书需在客户端关闭 TLS 验证
+
+    ## 项目地址
+
+    [GitHub](https://github.com/facilisvelox/minghe)
+
+  variables:
+    - key: MINGHE_HOST
+      type: STRING
+      name: Server Host
+      description: "Server IP or domain for SIP URI and TLS certificate (e.g. 192.168.1.100 or sip.example.com)"
+    - key: MINGHE_DEFAULT_PASSWORD
+      type: PASSWORD
+      name: Default Password
+      description: "Default password for all extensions (can be overridden per-extension in config)"
+    - key: RUST_LOG
+      type: STRING
+      name: Log Level
+      description: "Logging level: error, warn, info, debug, trace"
+
+  services:
+    - name: minghe
+      icon: https://raw.githubusercontent.com/nicbarker/clay/main/images/clay-logo-small.png
+      template: PREBUILT
+      spec:
+        source:
+          image: facilisvelox/minghe:latest
+        ports:
+          - id: sip-tls
+            port: 5061
+            type: TCP
+          - id: rtp-media
+            port: 20000
+            type: UDP
+        volumes:
+          - id: certs
+            dir: /app/certs
+          - id: config
+            dir: /app/config
+        env:
+          RUST_LOG:
+            default: "${RUST_LOG}"
+          TZ:
+            default: Asia/Shanghai
+        configs:
+          - path: /app/config/config.toml
+            template: |
+              [server]
+              listen_addr = "0.0.0.0"
+              sip_port = 5061
+              host = "${MINGHE_HOST}"
+
+              [extensions]
+              range_start = 1000
+              range_end = 2000
+              default_password = "${MINGHE_DEFAULT_PASSWORD}"
+
+              [tls]
+              cert_path = ""
+              key_path = ""
+
+              [media]
+              rtp_port_start = 20000
+              rtp_port_end = 30000
+              media_addr = ""
+
+              [passwords]
+            envsubst: true
+        instructions:
+          - type: TEXT
+            title: SIP TLS Port
+            content: "5061/TCP — Use Zeabur's TCP forwarding address to connect"
+            category: Connection
+          - type: TEXT
+            title: RTP Media Port
+            content: "20000-30000/UDP — For media relay (configure media_addr in config)"
+            category: Connection
+          - type: TEXT
+            title: Default Extension Range
+            content: "1000 - 2000"
+            category: Configuration
+          - type: PASSWORD
+            title: Default Password
+            content: "${MINGHE_DEFAULT_PASSWORD}"
+            category: Credentials
+
+  locales:
+    zh-CN:
+      description: "鸣鹤 — 最小化安全 SIP 语音通信服务器。纯 Rust 编写，TLS 信令加密，SRTP 媒体流加密，SIP Digest 认证。"
+      variables:
+        - key: MINGHE_HOST
+          name: 服务器地址
+          description: "服务器 IP 或域名，用于 SIP URI 和 TLS 证书生成（如 192.168.1.100 或 sip.example.com）"
+        - key: MINGHE_DEFAULT_PASSWORD
+          name: 默认密码
+          description: "所有分机的默认密码（可在配置文件中为单个分机设置独立密码）"
+        - key: RUST_LOG
+          name: 日志级别
+          description: "日志详细程度：error, warn, info, debug, trace"
