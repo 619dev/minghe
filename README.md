@@ -79,8 +79,10 @@ key_path = ""
 [media]
 rtp_port_start = 20000
 rtp_port_end = 30000
-media_addr = ""                  # 留空 = 自动检测
+media_addr = "192.168.1.100"     # 必填：客户端可访问的服务器媒体 IP
 ```
+
+> ⚠️ `media_addr` 不要留空。Docker、云平台或多网卡环境下自动检测通常会拿到容器内网 IP，导致接听后无声。请填写 Bria、Linkvil 等客户端能直接访问到的公网或内网 IP。
 
 ### 分机独立密码
 

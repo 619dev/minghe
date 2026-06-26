@@ -46,9 +46,9 @@ pub struct CallInfo {
     pub caller_writer: mpsc::Sender<Vec<u8>>,
     /// 被叫侧写入通道
     pub callee_writer: Option<mpsc::Sender<Vec<u8>>>,
-    /// 主叫侧 SRTP 密钥
+    /// 主叫侧 SRTP 密钥（保留给兼容旧接口，透明中继模式不使用）
     pub caller_crypto: SrtpCryptoSuite,
-    /// 被叫侧 SRTP 密钥
+    /// 被叫侧 SRTP 密钥（保留给兼容旧接口，透明中继模式不使用）
     pub callee_crypto: SrtpCryptoSuite,
     /// 主叫侧中继端口
     pub caller_relay_port: u16,
@@ -143,7 +143,9 @@ impl Router {
 
         tracing::info!(
             "收到 INVITE: {} -> {} (Call-ID: {})",
-            caller_ext, callee_ext, call_id
+            caller_ext,
+            callee_ext,
+            call_id
         );
 
         // 如果同一 Call-ID 已有活跃呼叫（上次呼叫残留），先清理
@@ -184,14 +186,11 @@ impl Router {
         let caller_crypto = SrtpCryptoSuite::new();
         let callee_crypto = SrtpCryptoSuite::new();
 
-        // 修改 SDP：替换媒体地址和端口，注入 SRTP crypto
+        // 修改 SDP：替换媒体地址和端口，保留原始 RTP/SRTP 参数
         let callee_invite = if let Some(body) = parser::extract_body(request_text) {
-            // 获取 callee_crypto 的 base64 key 用于被叫侧 SDP
+            // 透明中继模式下不替换 crypto key，仅为兼容函数签名保留参数。
             let callee_sdes = callee_crypto.to_sdes_attribute();
-            let callee_key = callee_sdes
-                .split("inline:")
-                .nth(1)
-                .unwrap_or_default();
+            let callee_key = callee_sdes.split("inline:").nth(1).unwrap_or_default();
 
             let new_sdp = parser::rewrite_sdp(
                 &body,
@@ -222,13 +221,16 @@ impl Router {
             callee_crypto,
             caller_relay_port: relay_session.caller_port,
             callee_relay_port: relay_session.callee_port,
-            relay_started: false,
+            relay_started: true,
         };
 
         {
             let mut calls = self.active_calls.write().unwrap();
             calls.insert(call_id.clone(), call_info);
         }
+
+        // 提前启动 UDP 媒体中继，确保被叫收到 SDP 后端口已经开始监听。
+        self.start_media_relay(&call_id).await;
 
         // 转发 INVITE 到被叫
         if let Err(e) = callee_writer.send(callee_invite).await {
@@ -309,27 +311,20 @@ impl Router {
         // 用原始 INVITE 的头部重建响应给主叫
         // 这样 Via、From、To、CSeq、Call-ID 都和主叫的原始请求匹配
         let forwarded_response = if let Some(body) = parser::extract_body(response_text) {
-            // 有 SDP body — 修改媒体地址并注入主叫侧 SRTP 密钥
+            // 有 SDP body — 修改媒体地址和端口，保留原始 RTP/SRTP 参数
             let caller_key = {
                 let calls = self.active_calls.read().unwrap();
                 if let Some(call) = calls.get(&call_id) {
                     let sdes = call.caller_crypto.to_sdes_attribute();
-                    sdes.split("inline:")
-                        .nth(1)
-                        .unwrap_or_default()
-                        .to_string()
+                    sdes.split("inline:").nth(1).unwrap_or_default().to_string()
                 } else {
                     String::new()
                 }
             };
 
             if !caller_key.is_empty() {
-                let new_sdp = parser::rewrite_sdp(
-                    &body,
-                    &media_addr,
-                    caller_relay_port,
-                    &caller_key,
-                );
+                let new_sdp =
+                    parser::rewrite_sdp(&body, &media_addr, caller_relay_port, &caller_key);
                 // 使用原始 INVITE 头部构建带 SDP 的响应
                 let reason = match status_code {
                     100 => "Trying",
@@ -354,13 +349,7 @@ impl Router {
                     200 => "OK",
                     _ => "Unknown",
                 };
-                parser::build_response_with_body(
-                    &original_invite,
-                    status_code,
-                    reason,
-                    &[],
-                    &body,
-                )
+                parser::build_response_with_body(&original_invite, status_code, reason, &[], &body)
             }
         } else {
             // 无 SDP body — 使用原始 INVITE 头部构建简单响应
@@ -439,15 +428,15 @@ impl Router {
     }
 
     /// 处理 BYE 请求
-    pub async fn handle_bye(
-        &self,
-        request_text: &str,
-        from_extension: &str,
-    ) -> Vec<u8> {
+    pub async fn handle_bye(&self, request_text: &str, from_extension: &str) -> Vec<u8> {
         let call_id = match parser::extract_call_id(request_text) {
             Some(id) => id,
             None => {
-                return parser::build_response(request_text, 481, "Call/Transaction Does Not Exist");
+                return parser::build_response(
+                    request_text,
+                    481,
+                    "Call/Transaction Does Not Exist",
+                );
             }
         };
 
@@ -475,10 +464,7 @@ impl Router {
             }
         }
 
-        tracing::info!(
-            "收到 BYE: 来自 {} (Call-ID: {})",
-            from_extension, call_id
-        );
+        tracing::info!("收到 BYE: 来自 {} (Call-ID: {})", from_extension, call_id);
 
         // 转发 BYE 到对端
         if let Some(writer) = other_writer {
@@ -495,14 +481,15 @@ impl Router {
     }
 
     /// 处理 CANCEL 请求
-    pub async fn handle_cancel(
-        &self,
-        request_text: &str,
-    ) -> Vec<u8> {
+    pub async fn handle_cancel(&self, request_text: &str) -> Vec<u8> {
         let call_id = match parser::extract_call_id(request_text) {
             Some(id) => id,
             None => {
-                return parser::build_response(request_text, 481, "Call/Transaction Does Not Exist");
+                return parser::build_response(
+                    request_text,
+                    481,
+                    "Call/Transaction Does Not Exist",
+                );
             }
         };
 
@@ -578,8 +565,10 @@ impl Router {
         let calls = self.active_calls.read().unwrap();
         if let Some(call) = calls.get(call_id) {
             tracing::info!(
-                "启动 SRTP B2BUA 媒体中继: Call-ID={}, 主叫端口={}, 被叫端口={}",
-                call_id, call.caller_relay_port, call.callee_relay_port
+                "启动 RTP/SRTP 透明媒体中继: Call-ID={}, 主叫端口={}, 被叫端口={}",
+                call_id,
+                call.caller_relay_port,
+                call.callee_relay_port
             );
 
             // 启动 UDP 中继任务
@@ -589,6 +578,8 @@ impl Router {
             let call_id_clone = call_id.to_string();
             let caller_crypto = call.caller_crypto.clone();
             let callee_crypto = call.callee_crypto.clone();
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            self.media_manager.register_shutdown(call_id, shutdown_tx);
 
             tokio::spawn(async move {
                 if let Err(e) = crate::media::relay::run_relay(
@@ -598,7 +589,10 @@ impl Router {
                     callee_port,
                     caller_crypto,
                     callee_crypto,
-                ).await {
+                    shutdown_rx,
+                )
+                .await
+                {
                     tracing::error!("媒体中继错误 ({}): {}", call_id_clone, e);
                 }
             });

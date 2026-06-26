@@ -2,7 +2,7 @@
 //!
 //! 管理 RTP 端口分配和媒体中继会话。
 //! 每通通话分配两对 UDP 端口，分别面向主叫和被叫，
-//! 作为 SRTP B2BUA：解密一侧的 SRTP，用另一侧的密钥重新加密后转发。
+//! 透明转发 RTP/SRTP 包，不参与端到端媒体密钥协商。
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -118,7 +118,9 @@ impl MediaRelayManager {
         sessions.insert(session_id.clone(), session.clone());
         tracing::info!(
             "创建媒体中继会话 {}: 主叫端口={}, 被叫端口={}",
-            session_id, caller_port, callee_port
+            session_id,
+            caller_port,
+            callee_port
         );
 
         Some(session)
@@ -167,37 +169,39 @@ impl MediaRelayManager {
     }
 }
 
-/// 运行 SRTP B2BUA 媒体中继
+/// 运行 RTP/SRTP 透明媒体中继
 ///
-/// 为指定的呼叫建立两个 UDP socket，双向中继 SRTP 数据包。
+/// 为指定的呼叫建立两个 UDP socket，双向中继媒体数据包。
 /// 采用"地址学习"机制：从首个收到的数据包中获取远端地址。
 ///
-/// SRTP B2BUA 模式：
-/// - 主叫 → 服务器：用 caller_crypto 解密
-/// - 服务器 → 被叫：用 callee_crypto 重新加密
-/// - 被叫 → 服务器：用 callee_crypto 解密
-/// - 服务器 → 主叫：用 caller_crypto 重新加密
+/// 媒体安全参数由两端客户端通过 SDP 直接协商，服务器只改写 SDP
+/// 中的媒体地址和端口，不解密、不重加密媒体包。
 pub async fn run_relay(
     call_id: &str,
     _media_addr: &str,
     caller_port: u16,
     callee_port: u16,
-    caller_crypto: SrtpCryptoSuite,
-    callee_crypto: SrtpCryptoSuite,
+    _caller_crypto: SrtpCryptoSuite,
+    _callee_crypto: SrtpCryptoSuite,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 绑定两个 UDP socket
     // 使用 0.0.0.0 监听所有接口（Docker 容器内 media_addr 是宿主机 IP，不可直接绑定）
     let caller_bind = format!("0.0.0.0:{}", caller_port);
     let callee_bind = format!("0.0.0.0:{}", callee_port);
 
-    let caller_socket = UdpSocket::bind(&caller_bind).await
+    let caller_socket = UdpSocket::bind(&caller_bind)
+        .await
         .map_err(|e| format!("无法绑定主叫侧 UDP 端口 {}: {}", caller_bind, e))?;
-    let callee_socket = UdpSocket::bind(&callee_bind).await
+    let callee_socket = UdpSocket::bind(&callee_bind)
+        .await
         .map_err(|e| format!("无法绑定被叫侧 UDP 端口 {}: {}", callee_bind, e))?;
 
     tracing::info!(
-        "SRTP B2BUA 媒体中继已启动: {} (主叫侧) <-> {} (被叫侧), Call-ID={}",
-        caller_bind, callee_bind, call_id
+        "RTP/SRTP 透明媒体中继已启动: {} (主叫侧) <-> {} (被叫侧), Call-ID={}",
+        caller_bind,
+        callee_bind,
+        call_id
     );
 
     let caller_socket = std::sync::Arc::new(caller_socket);
@@ -210,16 +214,13 @@ pub async fn run_relay(
     let call_id_str = call_id.to_string();
 
     // 任务1: 主叫侧 → 被叫侧
-    // 收到主叫的 SRTP → 用 caller_crypto 解密 → 用 callee_crypto 加密 → 发给被叫
     let cs1 = caller_socket.clone();
     let cs2 = callee_socket.clone();
     let cr1 = caller_remote.clone();
     let cr2 = callee_remote.clone();
     let cid1 = call_id_str.clone();
-    let decrypt_caller = caller_crypto.clone();
-    let encrypt_callee = callee_crypto.clone();
 
-    let task1 = tokio::spawn(async move {
+    let mut task1 = tokio::spawn(async move {
         let mut buf = [0u8; 2048];
         loop {
             match cs1.recv_from(&mut buf).await {
@@ -231,41 +232,19 @@ pub async fn run_relay(
                     {
                         let mut remote = cr1.lock().await;
                         if remote.is_none() {
-                            tracing::debug!(
-                                "[{}] 学习到主叫方地址: {}",
-                                cid1, addr
-                            );
+                            tracing::debug!("[{}] 学习到主叫方地址: {}", cid1, addr);
                             *remote = Some(addr);
                         }
                     }
-                    // SRTP 解密 → 重加密 → 转发到被叫方
+                    // 透明转发到被叫方
                     let callee_addr = {
                         let remote = cr2.lock().await;
                         *remote
                     };
                     if let Some(dest) = callee_addr {
                         let packet = &buf[..n];
-                        // 尝试 SRTP 解密→重加密
-                        match decrypt_caller.unprotect_rtp(packet) {
-                            Ok(rtp) => {
-                                // 用被叫侧密钥重新加密
-                                match encrypt_callee.protect_rtp(&rtp) {
-                                    Ok(srtp) => {
-                                        if let Err(e) = cs2.send_to(&srtp, dest).await {
-                                            tracing::debug!("转发到被叫失败: {}", e);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::debug!("[{}] 重加密失败: {}", cid1, e);
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                // 解密失败（可能是 RTCP 或非 SRTP 包），透传
-                                if let Err(e) = cs2.send_to(packet, dest).await {
-                                    tracing::debug!("透传到被叫失败: {}", e);
-                                }
-                            }
+                        if let Err(e) = cs2.send_to(packet, dest).await {
+                            tracing::debug!("转发到被叫失败: {}", e);
                         }
                     }
                     // 如果被叫地址未知，暂时丢弃包（等待被叫首先发包）
@@ -279,16 +258,13 @@ pub async fn run_relay(
     });
 
     // 任务2: 被叫侧 → 主叫侧
-    // 收到被叫的 SRTP → 用 callee_crypto 解密 → 用 caller_crypto 加密 → 发给主叫
     let cs3 = callee_socket.clone();
     let cs4 = caller_socket.clone();
     let cr3 = callee_remote.clone();
     let cr4 = caller_remote.clone();
     let cid2 = call_id_str.clone();
-    let decrypt_callee = callee_crypto;
-    let encrypt_caller = caller_crypto;
 
-    let task2 = tokio::spawn(async move {
+    let mut task2 = tokio::spawn(async move {
         let mut buf = [0u8; 2048];
         loop {
             match cs3.recv_from(&mut buf).await {
@@ -300,41 +276,19 @@ pub async fn run_relay(
                     {
                         let mut remote = cr3.lock().await;
                         if remote.is_none() {
-                            tracing::debug!(
-                                "[{}] 学习到被叫方地址: {}",
-                                cid2, addr
-                            );
+                            tracing::debug!("[{}] 学习到被叫方地址: {}", cid2, addr);
                             *remote = Some(addr);
                         }
                     }
-                    // SRTP 解密 → 重加密 → 转发到主叫方
+                    // 透明转发到主叫方
                     let caller_addr = {
                         let remote = cr4.lock().await;
                         *remote
                     };
                     if let Some(dest) = caller_addr {
                         let packet = &buf[..n];
-                        // 尝试 SRTP 解密→重加密
-                        match decrypt_callee.unprotect_rtp(packet) {
-                            Ok(rtp) => {
-                                // 用主叫侧密钥重新加密
-                                match encrypt_caller.protect_rtp(&rtp) {
-                                    Ok(srtp) => {
-                                        if let Err(e) = cs4.send_to(&srtp, dest).await {
-                                            tracing::debug!("转发到主叫失败: {}", e);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::debug!("[{}] 重加密失败: {}", cid2, e);
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                // 解密失败（可能是 RTCP 或非 SRTP 包），透传
-                                if let Err(e) = cs4.send_to(packet, dest).await {
-                                    tracing::debug!("透传到主叫失败: {}", e);
-                                }
-                            }
+                        if let Err(e) = cs4.send_to(packet, dest).await {
+                            tracing::debug!("转发到主叫失败: {}", e);
                         }
                     }
                 }
@@ -346,11 +300,15 @@ pub async fn run_relay(
         }
     });
 
-    // 等待任一任务结束
+    // 等待任一任务结束或呼叫清理信号
     tokio::select! {
-        _ = task1 => {},
-        _ = task2 => {},
+        _ = &mut task1 => {},
+        _ = &mut task2 => {},
+        _ = shutdown_rx.changed() => {},
     }
+
+    task1.abort();
+    task2.abort();
 
     tracing::info!("媒体中继已停止: Call-ID={}", call_id_str);
     Ok(())

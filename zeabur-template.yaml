@@ -30,8 +30,9 @@ spec:
     1. 部署完成后，在 Zeabur 控制台的 **Configs** 中编辑 `/app/config/config.toml`
     2. 将 `host` 修改为你的服务器 IP 或域名
     3. 修改 `default_password` 为强密码
-    4. 如需独立密码，在 `[passwords]` 段中添加
-    5. 重启服务使配置生效
+    4. 将 `media_addr` 修改为客户端可访问的服务器公网或内网 IP，不要留空，否则可能接听后无声
+    5. 如需独立密码，在 `[passwords]` 段中添加
+    6. 重启服务使配置生效
 
     ## 客户端连接
 
@@ -58,6 +59,10 @@ spec:
       type: PASSWORD
       name: Default Password
       description: "Default password for all extensions (can be overridden per-extension in config)"
+    - key: MINGHE_MEDIA_ADDR
+      type: STRING
+      name: Media Address
+      description: "Public or LAN IP reachable by SIP clients for RTP/SRTP media. Do not leave empty."
     - key: RUST_LOG
       type: STRING
       name: Log Level
@@ -107,7 +112,8 @@ spec:
               [media]
               rtp_port_start = 20000
               rtp_port_end = 30000
-              media_addr = ""
+              # 必填：客户端可访问的服务器媒体 IP。不要留空，否则可能接听后无声。
+              media_addr = "${MINGHE_MEDIA_ADDR}"
 
               [passwords]
             envsubst: true
@@ -118,7 +124,7 @@ spec:
             category: Connection
           - type: TEXT
             title: RTP Media Port
-            content: "20000-30000/UDP — For media relay (configure media_addr in config)"
+            content: "20000-30000/UDP — For media relay. Set media_addr to a client-reachable public/LAN IP; do not leave it empty."
             category: Connection
           - type: TEXT
             title: Default Extension Range
@@ -139,6 +145,9 @@ spec:
         - key: MINGHE_DEFAULT_PASSWORD
           name: 默认密码
           description: "所有分机的默认密码（可在配置文件中为单个分机设置独立密码）"
+        - key: MINGHE_MEDIA_ADDR
+          name: 媒体地址
+          description: "客户端可访问的服务器公网或内网 IP，用于 RTP/SRTP 媒体。不要留空。"
         - key: RUST_LOG
           name: 日志级别
           description: "日志详细程度：error, warn, info, debug, trace"

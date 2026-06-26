@@ -79,8 +79,10 @@ key_path = ""
 [media]
 rtp_port_start = 20000
 rtp_port_end = 30000
-media_addr = ""                  # Empty = auto-detect
+media_addr = "192.168.1.100"     # Required: media IP reachable by clients
 ```
+
+> ⚠️ Do not leave `media_addr` empty. In Docker, cloud platforms, or multi-NIC environments, auto-detection often returns a container/private interface address, which can cause calls to connect with no audio. Set it to the public or LAN IP reachable by Bria, Linkvil, and other clients.
 
 ### Per-Extension Passwords
 

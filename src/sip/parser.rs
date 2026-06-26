@@ -13,8 +13,7 @@ use uuid::Uuid;
 /// 将原始 TCP 字节流中的数据转换为 UTF-8 字符串，
 /// 然后尝试解析为 rsip::SipMessage。
 pub fn parse_sip_message(data: &[u8]) -> Result<rsip::SipMessage> {
-    let text = std::str::from_utf8(data)
-        .map_err(|e| anyhow!("SIP 消息 UTF-8 解码失败: {}", e))?;
+    let text = std::str::from_utf8(data).map_err(|e| anyhow!("SIP 消息 UTF-8 解码失败: {}", e))?;
     let msg: rsip::SipMessage = text
         .to_string()
         .try_into()
@@ -637,21 +636,14 @@ pub fn extract_uri_from_header(msg: &str, header_name: &str) -> Option<String> {
     None
 }
 
-/// 修改 SDP 中的媒体地址和端口，并注入 SRTP crypto 行
+/// 修改 SDP 中的媒体地址和端口
 ///
 /// 将 SDP 中的 c= 行替换为服务器中继地址，
-/// 将 m= 行的端口替换为中继端口，
-/// 并强制启用 SRTP（RTP/SAVP）+ 注入服务器侧 crypto 密钥。
-/// 服务器作为 SRTP B2BUA，每侧使用独立密钥，中继负责解密→重加密。
-pub fn rewrite_sdp(
-    sdp: &str,
-    relay_addr: &str,
-    relay_port: u16,
-    crypto_key_b64: &str,
-) -> String {
+/// 将 m=audio 行的端口替换为中继端口。
+/// 其余媒体参数（RTP/SRTP 协议、crypto、fingerprint 等）保持不变，
+/// 由两端客户端直接协商，服务器只做媒体地址中继。
+pub fn rewrite_sdp(sdp: &str, relay_addr: &str, relay_port: u16, _crypto_key_b64: &str) -> String {
     let mut result = Vec::new();
-    let mut found_media = false;
-    let mut crypto_inserted = false;
 
     for line in sdp.lines() {
         if line.starts_with("c=") {
@@ -662,12 +654,7 @@ pub fn rewrite_sdp(
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 4 {
                 // m=audio <port> <proto> <formats...>
-                let proto = if parts[2].contains("SAVP") {
-                    parts[2].to_string()
-                } else {
-                    // 将 RTP/AVP 替换为 RTP/SAVP 以启用 SRTP
-                    parts[2].replace("AVP", "SAVP")
-                };
+                let proto = parts[2];
                 let formats: Vec<&str> = parts[3..].to_vec();
                 result.push(format!(
                     "m=audio {} {} {}",
@@ -675,33 +662,12 @@ pub fn rewrite_sdp(
                     proto,
                     formats.join(" ")
                 ));
-                found_media = true;
             } else {
                 result.push(line.to_string());
             }
         } else {
-            // 在 m= 行之后，替换或注入 crypto
-            if found_media && !crypto_inserted && !line.starts_with("m=") {
-                if line.starts_with("a=crypto") {
-                    // 替换现有的 crypto 行
-                    result.push(format!(
-                        "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{}",
-                        crypto_key_b64
-                    ));
-                    crypto_inserted = true;
-                    continue;
-                }
-            }
             result.push(line.to_string());
         }
-    }
-
-    // 如果没有插入过 crypto 行，在末尾添加
-    if found_media && !crypto_inserted {
-        result.push(format!(
-            "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{}",
-            crypto_key_b64
-        ));
     }
 
     result.join("\r\n")
@@ -828,5 +794,23 @@ mod tests {
     fn test_extract_call_id() {
         let msg = "REGISTER sip:example.com SIP/2.0\r\nCall-ID: abc123@host\r\n\r\n";
         assert_eq!(extract_call_id(msg), Some("abc123@host".to_string()));
+    }
+
+    #[test]
+    fn test_rewrite_sdp_preserves_media_security_params() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 192.168.1.10\r\n",
+            "c=IN IP4 192.168.1.10\r\n",
+            "m=audio 4000 RTP/AVP 0 8 101\r\n",
+            "a=crypto:2 AES_CM_128_HMAC_SHA1_80 inline:CLIENTKEY\r\n"
+        );
+
+        let rewritten = rewrite_sdp(sdp, "203.0.113.10", 20000, "SERVERKEY");
+
+        assert!(rewritten.contains("c=IN IP4 203.0.113.10"));
+        assert!(rewritten.contains("m=audio 20000 RTP/AVP 0 8 101"));
+        assert!(rewritten.contains("a=crypto:2 AES_CM_128_HMAC_SHA1_80 inline:CLIENTKEY"));
+        assert!(!rewritten.contains("SERVERKEY"));
     }
 }
