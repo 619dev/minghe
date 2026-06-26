@@ -206,16 +206,23 @@ impl Router {
             let new_sdp = if let Some(crypto) = &callee_local_crypto {
                 let callee_sdes = crypto.to_sdes_attribute();
                 let callee_key = callee_sdes.split("inline:").nth(1).unwrap_or_default();
-                parser::rewrite_sdp(&body, &self.media_addr, relay_session.callee_port, callee_key)
+                parser::rewrite_sdp(
+                    &body,
+                    &self.media_addr,
+                    relay_session.callee_port,
+                    callee_key,
+                )
             } else {
                 parser::rewrite_sdp_plain(&body, &self.media_addr, relay_session.callee_port)
             };
 
-            // 重建 INVITE：替换 SDP body
-            rebuild_request_with_sdp(request_text, &new_sdp, &self.domain)
+            // 重建 INVITE：替换 SDP body，并把 Request-URI 指向被叫的注册 Contact
+            let rebuilt = rebuild_request_with_sdp(request_text, &new_sdp, &self.domain);
+            rewrite_request_uri_bytes(&rebuilt, &callee_ext, &self.domain, &self.registrar)
         } else {
             // 无 SDP 的 INVITE（后续通过 re-INVITE 协商）
-            request_text.as_bytes().to_vec()
+            rewrite_request_uri(request_text, &callee_ext, &self.domain, &self.registrar)
+                .into_bytes()
         };
 
         // 存储呼叫信息
@@ -276,6 +283,7 @@ impl Router {
         let caller_relay_port;
         let media_addr;
         let original_invite;
+        let callee_ext;
 
         {
             let mut calls = self.active_calls.write().unwrap();
@@ -330,6 +338,7 @@ impl Router {
             caller_relay_port = call.caller_relay_port;
             media_addr = self.media_addr.clone();
             original_invite = call.original_invite.clone();
+            callee_ext = call.callee_ext.clone();
         };
 
         // 用原始 INVITE 的头部重建响应给主叫
@@ -349,7 +358,8 @@ impl Router {
             };
 
             if let Some(caller_key) = caller_key {
-                let new_sdp = parser::rewrite_sdp(&body, &media_addr, caller_relay_port, &caller_key);
+                let new_sdp =
+                    parser::rewrite_sdp(&body, &media_addr, caller_relay_port, &caller_key);
                 // 使用原始 INVITE 头部构建带 SDP 的响应
                 let reason = match status_code {
                     100 => "Trying",
@@ -358,11 +368,12 @@ impl Router {
                     200 => "OK",
                     _ => "Unknown",
                 };
-                parser::build_response_with_body(
+                build_forwarded_invite_response(
                     &original_invite,
+                    response_text,
                     status_code,
                     reason,
-                    &[],
+                    &server_contact_uri(&callee_ext, &self.domain),
                     &new_sdp,
                 )
             } else {
@@ -375,11 +386,12 @@ impl Router {
                     200 => "OK",
                     _ => "Unknown",
                 };
-                parser::build_response_with_body(
+                build_forwarded_invite_response(
                     &original_invite,
+                    response_text,
                     status_code,
                     reason,
-                    &[],
+                    &server_contact_uri(&callee_ext, &self.domain),
                     &new_sdp,
                 )
             }
@@ -395,7 +407,14 @@ impl Router {
                 603 => "Decline",
                 _ => "Unknown",
             };
-            parser::build_response(&original_invite, status_code, reason)
+            build_forwarded_invite_response(
+                &original_invite,
+                response_text,
+                status_code,
+                reason,
+                &server_contact_uri(&callee_ext, &self.domain),
+                "",
+            )
         };
 
         // 转发给主叫
@@ -431,7 +450,10 @@ impl Router {
                 let calls = self.active_calls.read().unwrap();
                 if let Some(call) = calls.get(&call_id) {
                     if call.callee_local_crypto.is_some() && call.callee_remote_crypto.is_none() {
-                        tracing::warn!("媒体中继未启动：缺少被叫 SRTP crypto (Call-ID={})", call_id);
+                        tracing::warn!(
+                            "媒体中继未启动：缺少被叫 SRTP crypto (Call-ID={})",
+                            call_id
+                        );
                     }
                 }
             }
@@ -445,10 +467,10 @@ impl Router {
             None => return,
         };
 
-        let callee_writer = {
+        let (callee_writer, callee_ext) = {
             let calls = self.active_calls.read().unwrap();
             match calls.get(&call_id) {
-                Some(call) => call.callee_writer.clone(),
+                Some(call) => (call.callee_writer.clone(), call.callee_ext.clone()),
                 None => {
                     tracing::debug!("收到未知呼叫的 ACK: {}", call_id);
                     return;
@@ -458,7 +480,9 @@ impl Router {
 
         // 转发 ACK 到被叫
         if let Some(writer) = callee_writer {
-            if let Err(e) = writer.send(request_text.as_bytes().to_vec()).await {
+            let forwarded_ack =
+                rewrite_request_uri(request_text, &callee_ext, &self.domain, &self.registrar);
+            if let Err(e) = writer.send(forwarded_ack.into_bytes()).await {
                 tracing::error!("无法转发 ACK: {}", e);
             } else {
                 tracing::debug!("ACK 已转发 (Call-ID: {})", call_id);
@@ -480,6 +504,7 @@ impl Router {
         };
 
         let other_writer;
+        let other_ext;
 
         {
             let calls = self.active_calls.read().unwrap();
@@ -498,8 +523,10 @@ impl Router {
             // 确定对端的写入通道
             if from_extension == call.caller_ext {
                 other_writer = call.callee_writer.clone();
+                other_ext = call.callee_ext.clone();
             } else {
                 other_writer = Some(call.caller_writer.clone());
+                other_ext = call.caller_ext.clone();
             }
         }
 
@@ -507,7 +534,9 @@ impl Router {
 
         // 转发 BYE 到对端
         if let Some(writer) = other_writer {
-            if let Err(e) = writer.send(request_text.as_bytes().to_vec()).await {
+            let forwarded_bye =
+                rewrite_request_uri(request_text, &other_ext, &self.domain, &self.registrar);
+            if let Err(e) = writer.send(forwarded_bye.into_bytes()).await {
                 tracing::error!("无法转发 BYE: {}", e);
             }
         }
@@ -533,6 +562,7 @@ impl Router {
         };
 
         let callee_writer;
+        let callee_ext;
         let original_invite;
 
         {
@@ -550,6 +580,7 @@ impl Router {
 
             call.state = CallState::Terminated;
             callee_writer = call.callee_writer.clone();
+            callee_ext = call.callee_ext.clone();
             original_invite = call.original_invite.clone();
         }
 
@@ -557,7 +588,9 @@ impl Router {
 
         // 转发 CANCEL 到被叫
         if let Some(writer) = callee_writer {
-            if let Err(e) = writer.send(request_text.as_bytes().to_vec()).await {
+            let forwarded_cancel =
+                rewrite_request_uri(request_text, &callee_ext, &self.domain, &self.registrar);
+            if let Err(e) = writer.send(forwarded_cancel.into_bytes()).await {
                 tracing::error!("无法转发 CANCEL: {}", e);
             }
 
@@ -696,9 +729,128 @@ fn rebuild_request_with_sdp(request: &str, new_sdp: &str, _domain: &str) -> Vec<
     result.into_bytes()
 }
 
-/// 重建带有新 SDP 的 SIP 响应
-fn rebuild_response_with_sdp(response: &str, new_sdp: &str) -> Vec<u8> {
-    rebuild_request_with_sdp(response, new_sdp, "")
+fn rewrite_request_uri_bytes(
+    request: &[u8],
+    target_ext: &str,
+    domain: &str,
+    registrar: &RegistrarService,
+) -> Vec<u8> {
+    match std::str::from_utf8(request) {
+        Ok(text) => rewrite_request_uri(text, target_ext, domain, registrar).into_bytes(),
+        Err(_) => request.to_vec(),
+    }
+}
+
+fn rewrite_request_uri(
+    request: &str,
+    target_ext: &str,
+    domain: &str,
+    registrar: &RegistrarService,
+) -> String {
+    let target_uri = registrar
+        .lookup(target_ext)
+        .map(|reg| reg.contact)
+        .unwrap_or_else(|| format!("sips:{}@{};transport=tls", target_ext, domain));
+
+    let mut lines = request.lines();
+    let Some(first_line) = lines.next() else {
+        return request.to_string();
+    };
+
+    let parts: Vec<&str> = first_line.split_whitespace().collect();
+    if parts.len() != 3 || parts[0].starts_with("SIP/2.0") {
+        return request.to_string();
+    }
+
+    let mut rewritten = format!("{} {} {}", parts[0], target_uri, parts[2]);
+    for line in lines {
+        rewritten.push_str("\r\n");
+        rewritten.push_str(line);
+    }
+
+    if request.ends_with("\r\n") {
+        rewritten.push_str("\r\n");
+    }
+    rewritten
+}
+
+fn build_forwarded_invite_response(
+    original_invite: &str,
+    callee_response: &str,
+    status_code: u16,
+    reason: &str,
+    contact_uri: &str,
+    body: &str,
+) -> Vec<u8> {
+    let mut response = format!("SIP/2.0 {} {}\r\n", status_code, reason);
+
+    for via in header_lines(original_invite, "Via", Some("v")) {
+        response.push_str(&via);
+        response.push_str("\r\n");
+    }
+
+    if let Some(from) = first_header_line(original_invite, "From", Some("f")) {
+        response.push_str(&from);
+        response.push_str("\r\n");
+    }
+
+    let to = first_header_line(callee_response, "To", Some("t"))
+        .or_else(|| first_header_line(original_invite, "To", Some("t")))
+        .unwrap_or_else(|| format!("To: <sips:{}>", contact_uri));
+    response.push_str(&to);
+    response.push_str("\r\n");
+
+    if let Some(call_id) = first_header_line(original_invite, "Call-ID", Some("i")) {
+        response.push_str(&call_id);
+        response.push_str("\r\n");
+    }
+
+    if let Some(cseq) = first_header_line(original_invite, "CSeq", None) {
+        response.push_str(&cseq);
+        response.push_str("\r\n");
+    }
+
+    if status_code >= 200 && status_code < 300 {
+        response.push_str(&format!("Contact: <{}>\r\n", contact_uri));
+    }
+
+    let body_bytes = body.as_bytes();
+    if !body.is_empty() {
+        response.push_str("Content-Type: application/sdp\r\n");
+    }
+    response.push_str(&format!("Content-Length: {}\r\n\r\n", body_bytes.len()));
+    if !body.is_empty() {
+        response.push_str(body);
+    }
+
+    response.into_bytes()
+}
+
+fn header_lines(msg: &str, name: &str, compact: Option<&str>) -> Vec<String> {
+    let name_prefix = format!("{}:", name.to_lowercase());
+    let compact_prefix = compact.map(|c| format!("{}:", c.to_lowercase()));
+
+    msg.lines()
+        .map(str::trim)
+        .take_while(|line| !line.is_empty())
+        .filter(|line| {
+            let lower = line.to_lowercase();
+            lower.starts_with(&name_prefix)
+                || compact_prefix
+                    .as_ref()
+                    .map(|prefix| lower.starts_with(prefix))
+                    .unwrap_or(false)
+        })
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn first_header_line(msg: &str, name: &str, compact: Option<&str>) -> Option<String> {
+    header_lines(msg, name, compact).into_iter().next()
+}
+
+fn server_contact_uri(extension: &str, domain: &str) -> String {
+    format!("sips:{}@{};transport=tls", extension, domain)
 }
 
 fn extract_srtp_crypto_from_sdp(sdp: &str) -> Option<SrtpCryptoSuite> {
@@ -716,4 +868,72 @@ fn extract_srtp_crypto_from_sdp(sdp: &str) -> Option<SrtpCryptoSuite> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn forwarded_invite_response_preserves_callee_to_tag_and_adds_server_contact() {
+        let original_invite = concat!(
+            "INVITE sip:1002@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/TLS caller.example.com;branch=z9hG4bKcaller\r\n",
+            "From: <sips:1001@example.com>;tag=caller-tag\r\n",
+            "To: <sips:1002@example.com>\r\n",
+            "Call-ID: call-1\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Content-Length: 0\r\n\r\n"
+        );
+        let callee_response = concat!(
+            "SIP/2.0 200 OK\r\n",
+            "Via: SIP/2.0/TLS caller.example.com;branch=z9hG4bKcaller\r\n",
+            "From: <sips:1001@example.com>;tag=caller-tag\r\n",
+            "To: <sips:1002@example.com>;tag=callee-tag\r\n",
+            "Call-ID: call-1\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Content-Length: 0\r\n\r\n"
+        );
+
+        let response = build_forwarded_invite_response(
+            original_invite,
+            callee_response,
+            200,
+            "OK",
+            "sips:1002@example.com;transport=tls",
+            "v=0\r\n",
+        );
+        let response_text = String::from_utf8(response).unwrap();
+
+        assert!(response_text.contains("To: <sips:1002@example.com>;tag=callee-tag\r\n"));
+        assert!(response_text.contains("Contact: <sips:1002@example.com;transport=tls>\r\n"));
+        assert!(!response_text.contains("caller-tag;tag="));
+    }
+
+    #[test]
+    fn in_dialog_request_uri_is_rewritten_to_target_contact_fallback() {
+        let registrar = RegistrarService::new(
+            "example.com".to_string(),
+            "secret".to_string(),
+            HashMap::new(),
+            1000,
+            2000,
+        );
+        let ack = concat!(
+            "ACK sips:1002@stale-contact.invalid SIP/2.0\r\n",
+            "Via: SIP/2.0/TLS caller.example.com;branch=z9hG4bKack\r\n",
+            "From: <sips:1001@example.com>;tag=caller-tag\r\n",
+            "To: <sips:1002@example.com>;tag=callee-tag\r\n",
+            "Call-ID: call-1\r\n",
+            "CSeq: 1 ACK\r\n",
+            "Content-Length: 0\r\n\r\n"
+        );
+
+        let rewritten = rewrite_request_uri(ack, "1002", "example.com", &registrar);
+
+        assert!(rewritten.starts_with("ACK sips:1002@example.com;transport=tls SIP/2.0\r\n"));
+        assert!(!rewritten.contains("stale-contact.invalid"));
+        assert!(rewritten.contains("To: <sips:1002@example.com>;tag=callee-tag\r\n"));
+    }
 }
