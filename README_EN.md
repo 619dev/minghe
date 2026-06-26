@@ -116,7 +116,12 @@ Set individual passwords in `[passwords]`. Extensions not listed use `default_pa
 
 ## Client Configuration
 
-Any SIP softphone supporting SIP over TLS can be used (Onesip, Onesip, Onesip, Onesip, etc.).
+Recommended clients:
+
+- iOS / Android: Bria Mobile app
+- Desk phones: Fanvil Linkvil W610W / W620W
+
+Other clients should support SIP over TLS, SDES-SRTP (`AES_CM_128_HMAC_SHA1_80`), and configurable self-signed certificate verification behavior.
 
 | Setting | Value |
 |:--------|:------|

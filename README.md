@@ -116,7 +116,12 @@ media_addr = "192.168.1.100"     # 必填：客户端可访问的服务器媒体
 
 ## 客户端配置
 
-任何支持 SIP over TLS 的软电话均可使用（Onesip、Onesip、Onesip、Onesip 等）。
+推荐客户端：
+
+- iOS / Android：Bria Mobile app
+- 桌面电话机：方位 Linkvil W610W / W620W
+
+其他客户端需支持 SIP over TLS、SDES-SRTP（`AES_CM_128_HMAC_SHA1_80`）以及可配置自签名证书验证策略。
 
 | 配置项 | 值 |
 |:------|:----|
