@@ -38,6 +38,10 @@ pub struct CallInfo {
     pub caller_tag: String,
     /// 被叫 To tag
     pub callee_tag: Option<String>,
+    /// 主叫侧远端 Contact（主叫对话的 remote target）
+    pub caller_remote_contact: Option<String>,
+    /// 被叫侧远端 Contact（被叫对话的 remote target）
+    pub callee_remote_contact: Option<String>,
     /// 呼叫状态
     pub state: CallState,
     /// 主叫原始 INVITE 消息（用于构建后续响应）
@@ -218,11 +222,21 @@ impl Router {
 
             // 重建 INVITE：替换 SDP body，并把 Request-URI 指向被叫的注册 Contact
             let rebuilt = rebuild_request_with_sdp(request_text, &new_sdp, &self.domain);
-            rewrite_request_uri_bytes(&rebuilt, &callee_ext, &self.domain, &self.registrar)
+            build_outbound_request_bytes(
+                &rebuilt,
+                &registered_contact_uri(&callee_ext, &self.domain, &self.registrar),
+                &self.domain,
+                &server_contact_uri(&caller_ext, &self.domain),
+            )
         } else {
             // 无 SDP 的 INVITE（后续通过 re-INVITE 协商）
-            rewrite_request_uri(request_text, &callee_ext, &self.domain, &self.registrar)
-                .into_bytes()
+            build_outbound_request(
+                request_text,
+                &registered_contact_uri(&callee_ext, &self.domain, &self.registrar),
+                &self.domain,
+                &server_contact_uri(&caller_ext, &self.domain),
+            )
+            .into_bytes()
         };
 
         // 存储呼叫信息
@@ -232,6 +246,8 @@ impl Router {
             callee_ext: callee_ext.clone(),
             caller_tag,
             callee_tag: None,
+            caller_remote_contact: parser::extract_contact_uri(request_text),
+            callee_remote_contact: None,
             state: CallState::Trying,
             original_invite: request_text.to_string(),
             caller_writer: caller_writer.clone(),
@@ -312,6 +328,9 @@ impl Router {
                     }
                     if call.callee_tag.is_none() {
                         call.callee_tag = parser::extract_to_tag(response_text);
+                    }
+                    if call.callee_remote_contact.is_none() {
+                        call.callee_remote_contact = parser::extract_contact_uri(response_text);
                     }
                     if call.callee_local_crypto.is_some() && call.callee_remote_crypto.is_none() {
                         if let Some(crypto) = parser::extract_body(response_text)
@@ -467,10 +486,15 @@ impl Router {
             None => return,
         };
 
-        let (callee_writer, callee_ext) = {
+        let (callee_writer, target_uri) = {
             let calls = self.active_calls.read().unwrap();
             match calls.get(&call_id) {
-                Some(call) => (call.callee_writer.clone(), call.callee_ext.clone()),
+                Some(call) => (
+                    call.callee_writer.clone(),
+                    call.callee_remote_contact.clone().unwrap_or_else(|| {
+                        registered_contact_uri(&call.callee_ext, &self.domain, &self.registrar)
+                    }),
+                ),
                 None => {
                     tracing::debug!("收到未知呼叫的 ACK: {}", call_id);
                     return;
@@ -480,8 +504,7 @@ impl Router {
 
         // 转发 ACK 到被叫
         if let Some(writer) = callee_writer {
-            let forwarded_ack =
-                rewrite_request_uri(request_text, &callee_ext, &self.domain, &self.registrar);
+            let forwarded_ack = build_outbound_request(request_text, &target_uri, &self.domain, "");
             if let Err(e) = writer.send(forwarded_ack.into_bytes()).await {
                 tracing::error!("无法转发 ACK: {}", e);
             } else {
@@ -504,7 +527,7 @@ impl Router {
         };
 
         let other_writer;
-        let other_ext;
+        let target_uri;
 
         {
             let calls = self.active_calls.read().unwrap();
@@ -523,10 +546,14 @@ impl Router {
             // 确定对端的写入通道
             if from_extension == call.caller_ext {
                 other_writer = call.callee_writer.clone();
-                other_ext = call.callee_ext.clone();
+                target_uri = call.callee_remote_contact.clone().unwrap_or_else(|| {
+                    registered_contact_uri(&call.callee_ext, &self.domain, &self.registrar)
+                });
             } else {
                 other_writer = Some(call.caller_writer.clone());
-                other_ext = call.caller_ext.clone();
+                target_uri = call.caller_remote_contact.clone().unwrap_or_else(|| {
+                    registered_contact_uri(&call.caller_ext, &self.domain, &self.registrar)
+                });
             }
         }
 
@@ -534,8 +561,7 @@ impl Router {
 
         // 转发 BYE 到对端
         if let Some(writer) = other_writer {
-            let forwarded_bye =
-                rewrite_request_uri(request_text, &other_ext, &self.domain, &self.registrar);
+            let forwarded_bye = build_outbound_request(request_text, &target_uri, &self.domain, "");
             if let Err(e) = writer.send(forwarded_bye.into_bytes()).await {
                 tracing::error!("无法转发 BYE: {}", e);
             }
@@ -562,7 +588,7 @@ impl Router {
         };
 
         let callee_writer;
-        let callee_ext;
+        let target_uri;
         let original_invite;
 
         {
@@ -580,7 +606,9 @@ impl Router {
 
             call.state = CallState::Terminated;
             callee_writer = call.callee_writer.clone();
-            callee_ext = call.callee_ext.clone();
+            target_uri = call.callee_remote_contact.clone().unwrap_or_else(|| {
+                registered_contact_uri(&call.callee_ext, &self.domain, &self.registrar)
+            });
             original_invite = call.original_invite.clone();
         }
 
@@ -589,7 +617,7 @@ impl Router {
         // 转发 CANCEL 到被叫
         if let Some(writer) = callee_writer {
             let forwarded_cancel =
-                rewrite_request_uri(request_text, &callee_ext, &self.domain, &self.registrar);
+                build_outbound_request(request_text, &target_uri, &self.domain, "");
             if let Err(e) = writer.send(forwarded_cancel.into_bytes()).await {
                 tracing::error!("无法转发 CANCEL: {}", e);
             }
@@ -729,29 +757,24 @@ fn rebuild_request_with_sdp(request: &str, new_sdp: &str, _domain: &str) -> Vec<
     result.into_bytes()
 }
 
-fn rewrite_request_uri_bytes(
+fn build_outbound_request_bytes(
     request: &[u8],
-    target_ext: &str,
+    target_uri: &str,
     domain: &str,
-    registrar: &RegistrarService,
+    contact_uri: &str,
 ) -> Vec<u8> {
     match std::str::from_utf8(request) {
-        Ok(text) => rewrite_request_uri(text, target_ext, domain, registrar).into_bytes(),
+        Ok(text) => build_outbound_request(text, target_uri, domain, contact_uri).into_bytes(),
         Err(_) => request.to_vec(),
     }
 }
 
-fn rewrite_request_uri(
+fn build_outbound_request(
     request: &str,
-    target_ext: &str,
+    target_uri: &str,
     domain: &str,
-    registrar: &RegistrarService,
+    contact_uri: &str,
 ) -> String {
-    let target_uri = registrar
-        .lookup(target_ext)
-        .map(|reg| reg.contact)
-        .unwrap_or_else(|| format!("sips:{}@{};transport=tls", target_ext, domain));
-
     let mut lines = request.lines();
     let Some(first_line) = lines.next() else {
         return request.to_string();
@@ -762,16 +785,51 @@ fn rewrite_request_uri(
         return request.to_string();
     }
 
-    let mut rewritten = format!("{} {} {}", parts[0], target_uri, parts[2]);
+    let mut rewritten = Vec::new();
+    let mut saw_contact = false;
+    rewritten.push(format!("{} {} {}", parts[0], target_uri, parts[2]));
+    rewritten.push(format!(
+        "Via: SIP/2.0/TLS {};branch={}",
+        domain,
+        parser::generate_branch()
+    ));
+
     for line in lines {
-        rewritten.push_str("\r\n");
-        rewritten.push_str(line);
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+
+        let lower = trimmed.to_lowercase();
+        if lower.starts_with("via:") || lower.starts_with("v:") {
+            continue;
+        }
+        if lower.starts_with("route:") {
+            continue;
+        }
+        if lower.starts_with("record-route:") {
+            continue;
+        }
+        if lower.starts_with("contact:") || lower.starts_with("m:") {
+            if !contact_uri.is_empty() {
+                rewritten.push(format!("Contact: <{}>", contact_uri));
+                saw_contact = true;
+            }
+            continue;
+        }
+
+        rewritten.push(trimmed.to_string());
     }
 
-    if request.ends_with("\r\n") {
-        rewritten.push_str("\r\n");
+    if !contact_uri.is_empty() && !saw_contact {
+        rewritten.push(format!("Contact: <{}>", contact_uri));
     }
-    rewritten
+
+    let body = parser::extract_body(request).unwrap_or_default();
+    let mut result = rewritten.join("\r\n");
+    result.push_str("\r\n\r\n");
+    result.push_str(&body);
+    result
 }
 
 fn build_forwarded_invite_response(
@@ -853,6 +911,13 @@ fn server_contact_uri(extension: &str, domain: &str) -> String {
     format!("sips:{}@{};transport=tls", extension, domain)
 }
 
+fn registered_contact_uri(extension: &str, domain: &str, registrar: &RegistrarService) -> String {
+    registrar
+        .lookup(extension)
+        .map(|reg| reg.contact)
+        .unwrap_or_else(|| server_contact_uri(extension, domain))
+}
+
 fn extract_srtp_crypto_from_sdp(sdp: &str) -> Option<SrtpCryptoSuite> {
     for line in sdp.lines() {
         let trimmed = line.trim();
@@ -873,7 +938,6 @@ fn extract_srtp_crypto_from_sdp(sdp: &str) -> Option<SrtpCryptoSuite> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     #[test]
     fn forwarded_invite_response_preserves_callee_to_tag_and_adds_server_contact() {
@@ -912,14 +976,36 @@ mod tests {
     }
 
     #[test]
-    fn in_dialog_request_uri_is_rewritten_to_target_contact_fallback() {
-        let registrar = RegistrarService::new(
-            "example.com".to_string(),
-            "secret".to_string(),
-            HashMap::new(),
-            1000,
-            2000,
+    fn outbound_invite_uses_server_via_and_contact() {
+        let invite = concat!(
+            "INVITE sip:1002@stale-contact.invalid SIP/2.0\r\n",
+            "Via: SIP/2.0/TLS caller.example.com;branch=z9hG4bKcaller\r\n",
+            "Route: <sip:old-proxy.invalid;lr>\r\n",
+            "From: <sips:1001@example.com>;tag=caller-tag\r\n",
+            "To: <sips:1002@example.com>\r\n",
+            "Contact: <sips:1001@caller-device.invalid;transport=tls>\r\n",
+            "Call-ID: call-1\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Content-Length: 0\r\n\r\n"
         );
+
+        let rewritten = build_outbound_request(
+            invite,
+            "sips:1002@callee-device.invalid;transport=tls",
+            "example.com",
+            "sips:1001@example.com;transport=tls",
+        );
+
+        assert!(rewritten
+            .starts_with("INVITE sips:1002@callee-device.invalid;transport=tls SIP/2.0\r\n"));
+        assert!(rewritten.contains("Via: SIP/2.0/TLS example.com;branch=z9hG4bK"));
+        assert!(rewritten.contains("Contact: <sips:1001@example.com;transport=tls>\r\n"));
+        assert!(!rewritten.contains("caller-device.invalid"));
+        assert!(!rewritten.contains("old-proxy.invalid"));
+    }
+
+    #[test]
+    fn in_dialog_request_uri_is_rewritten_to_target_contact() {
         let ack = concat!(
             "ACK sips:1002@stale-contact.invalid SIP/2.0\r\n",
             "Via: SIP/2.0/TLS caller.example.com;branch=z9hG4bKack\r\n",
@@ -930,9 +1016,17 @@ mod tests {
             "Content-Length: 0\r\n\r\n"
         );
 
-        let rewritten = rewrite_request_uri(ack, "1002", "example.com", &registrar);
+        let rewritten = build_outbound_request(
+            ack,
+            "sips:1002@callee-device.invalid;transport=tls",
+            "example.com",
+            "",
+        );
 
-        assert!(rewritten.starts_with("ACK sips:1002@example.com;transport=tls SIP/2.0\r\n"));
+        assert!(
+            rewritten.starts_with("ACK sips:1002@callee-device.invalid;transport=tls SIP/2.0\r\n")
+        );
+        assert!(rewritten.contains("Via: SIP/2.0/TLS example.com;branch=z9hG4bK"));
         assert!(!rewritten.contains("stale-contact.invalid"));
         assert!(rewritten.contains("To: <sips:1002@example.com>;tag=callee-tag\r\n"));
     }
