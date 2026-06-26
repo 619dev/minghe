@@ -117,7 +117,7 @@ impl MediaRelayManager {
         let mut sessions = self.sessions.lock().unwrap();
         sessions.insert(session_id.clone(), session.clone());
         tracing::info!(
-            "创建媒体中继会话 {}: 主叫端口={}, 被叫端口={}",
+            "创建媒体中继会话 {}: 主叫侧 SDP 端口={}, 被叫侧 SDP 端口={}。这两个 UDP 端口都必须能被客户端访问",
             session_id,
             caller_port,
             callee_port

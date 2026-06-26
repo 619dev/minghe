@@ -20,15 +20,7 @@
 
 ## Quick Start
 
-### Zeabur One-Click Deploy
-
-```bash
-npx zeabur@latest template deploy -f zeabur-template.yaml
-```
-
-Or import [`zeabur-template.yaml`](zeabur-template.yaml) in the Zeabur dashboard.
-
-### Docker Deployment (Recommended)
+### Docker / VPS Deployment (Recommended)
 
 ```bash
 # 1. Prepare configuration
@@ -44,6 +36,8 @@ docker compose up -d
 # 4. View logs
 docker compose logs -f
 ```
+
+> ⚠️ This project no longer ships a Zeabur template. SIP signaling uses TCP/TLS, but audio media uses SRTP/UDP. The configured UDP port range must be reachable from clients on the same public port numbers advertised in SDP. Platforms that only support HTTP/TCP forwarding, random external ports, or no UDP port ranges are not suitable for direct deployment.
 
 ### Build from Source
 
@@ -83,6 +77,19 @@ media_addr = "192.168.1.100"     # Required: media IP reachable by clients
 ```
 
 > ⚠️ Do not leave `media_addr` empty. In Docker, cloud platforms, or multi-NIC environments, auto-detection often returns a container/private interface address, which can cause calls to connect with no audio. Set it to the public or LAN IP reachable by Bria, Linkvil, and other clients.
+
+> Each call uses two even UDP ports by default, for example `20000/UDP` and `20002/UDP` for the first call. Firewalls, cloud security groups, and container port mappings must allow both.
+
+### Platform Requirements
+
+| Item | Requirement |
+|:-----|:------------|
+| SIP signaling | Fixed public TCP port, default `5061/tcp` |
+| SRTP media | Fixed public UDP port range, default `20000-30000/udp` |
+| Port mapping | External ports must match the ports advertised in SDP |
+| Media address | `media_addr` must be a public or LAN IP reachable by clients |
+
+If the platform cannot expose a fixed UDP port range, the usual symptom is: extensions register, calls connect, calls can be answered, but both sides have no audio.
 
 ### Per-Extension Passwords
 
@@ -163,7 +170,6 @@ minghe/
 ├── Dockerfile                # Multi-stage build
 ├── docker-compose.yml        # Container orchestration
 ├── build-and-push.sh         # Multi-arch image build script
-├── zeabur-template.yaml     # Zeabur one-click deploy template
 ├── .env                      # Docker Compose environment variables
 └── src/
     ├── main.rs               # Entry point, CLI, graceful shutdown

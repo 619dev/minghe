@@ -54,6 +54,8 @@ key_path = ""
 # RTP 中继端口范围
 # 每通通话占用 2 个 UDP 端口（主叫侧 + 被叫侧）
 # 端口数量 = (rtp_port_end - rtp_port_start) / 2 = 最大并发通话数
+# 防火墙、云安全组、容器端口映射必须开放相同的 UDP 端口范围。
+# 只支持 TCP/HTTP 转发、随机外部端口或无法开放 UDP 端口范围的平台不适合部署本服务。
 rtp_port_start = 20000
 rtp_port_end = 30000
 

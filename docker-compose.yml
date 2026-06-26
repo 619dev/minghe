@@ -26,7 +26,8 @@ services:
     ports:
       # SIP TLS 信令端口
       - "${SIP_PORT:-5061}:5061/tcp"
-      # RTP 媒体端口范围（UDP）
+      # RTP/SRTP 媒体端口范围（UDP）
+      # 外部端口必须与容器端口一致，因为 SDP 会直接公布这些端口。
       - "${RTP_PORT_START:-20000}-${RTP_PORT_END:-30000}:20000-30000/udp"
 
     # 卷挂载

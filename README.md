@@ -20,15 +20,7 @@
 
 ## 快速开始
 
-### Zeabur 一键部署
-
-```bash
-npx zeabur@latest template deploy -f zeabur-template.yaml
-```
-
-或在 Zeabur 控制台中导入 [`zeabur-template.yaml`](zeabur-template.yaml) 模板。
-
-### Docker 部署（推荐）
+### Docker / VPS 部署（推荐）
 
 ```bash
 # 1. 准备配置
@@ -44,6 +36,8 @@ docker compose up -d
 # 4. 查看日志
 docker compose logs -f
 ```
+
+> ⚠️ 本项目不再提供 Zeabur 模板。SIP 信令使用 TCP/TLS，但语音媒体使用 SRTP/UDP，必须保证配置中的 UDP 端口范围能以相同公网端口直达容器。只支持 HTTP/TCP 转发、随机外部端口或无法开放 UDP 端口范围的平台不适合直接部署本服务。
 
 ### 从源码编译
 
@@ -83,6 +77,19 @@ media_addr = "192.168.1.100"     # 必填：客户端可访问的服务器媒体
 ```
 
 > ⚠️ `media_addr` 不要留空。Docker、云平台或多网卡环境下自动检测通常会拿到容器内网 IP，导致接听后无声。请填写 Bria、Linkvil 等客户端能直接访问到的公网或内网 IP。
+
+> 每通电话默认占用两个偶数 UDP 端口，例如第一通为 `20000/UDP` 和 `20002/UDP`。防火墙、云安全组、容器平台端口映射必须同时放行这些端口。
+
+### 部署平台要求
+
+| 项目 | 要求 |
+|:-----|:-----|
+| SIP 信令 | 固定公网 TCP 端口，默认 `5061/tcp` |
+| SRTP 媒体 | 固定公网 UDP 端口范围，默认 `20000-30000/udp` |
+| 端口映射 | 外部端口必须与 SDP 中公布的端口一致 |
+| 媒体地址 | `media_addr` 必须是客户端可访问的公网或内网 IP |
+
+如果部署平台无法开放固定 UDP 端口范围，常见现象是：分机能注册、能拨通、能接听，但双方没有声音。
 
 ### 分机独立密码
 
@@ -163,7 +170,6 @@ minghe/
 ├── Dockerfile                # 多阶段构建
 ├── docker-compose.yml        # 容器编排
 ├── build-and-push.sh         # 多架构镜像构建脚本
-├── zeabur-template.yaml     # Zeabur 一键部署模板
 ├── .env                      # Docker Compose 环境变量
 └── src/
     ├── main.rs               # 入口、CLI、优雅关闭
