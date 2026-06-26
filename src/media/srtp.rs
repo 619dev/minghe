@@ -39,11 +39,11 @@ const RTP_HEADER_MIN_LEN: usize = 12;
 /// KDF 标签：加密密钥
 const LABEL_CIPHER_KEY: u8 = 0x00;
 
-/// KDF 标签：盐值
-const LABEL_SALT: u8 = 0x01;
-
 /// KDF 标签：认证密钥
-const LABEL_AUTH_KEY: u8 = 0x02;
+const LABEL_AUTH_KEY: u8 = 0x01;
+
+/// KDF 标签：盐值
+const LABEL_SALT: u8 = 0x02;
 
 /// SRTP 加密套件错误类型
 #[derive(Debug)]
@@ -778,6 +778,29 @@ mod tests {
         cipher.encrypt_block(&mut aes_block);
 
         assert_eq!(&suite.session_key[..], &aes_block[..]);
+    }
+
+    #[test]
+    fn test_kdf_uses_rfc3711_srtp_labels() {
+        let mut suite = SrtpCryptoSuite {
+            master_key: [0u8; MASTER_KEY_LEN],
+            master_salt: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+            session_key: [0u8; SESSION_KEY_LEN],
+            session_salt: [0u8; SESSION_SALT_LEN],
+            session_auth_key: [0u8; SESSION_AUTH_KEY_LEN],
+            roc: 0,
+        };
+        suite.derive_session_keys();
+
+        let expected_auth_key: [u8; SESSION_AUTH_KEY_LEN] =
+            suite.prf_derive_auth(0x01, SESSION_AUTH_KEY_LEN);
+        let expected_salt_full: [u8; SESSION_KEY_LEN] = suite.prf_derive(0x02, SESSION_KEY_LEN);
+
+        assert_eq!(suite.session_auth_key, expected_auth_key);
+        assert_eq!(
+            &suite.session_salt[..],
+            &expected_salt_full[..SESSION_SALT_LEN]
+        );
     }
 
     /// 测试认证标签篡改检测
