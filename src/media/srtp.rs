@@ -219,11 +219,11 @@ impl SrtpCryptoSuite {
         let cipher =
             Aes128::new_from_slice(&self.master_key).expect("AES-128 密钥长度必须为 16 字节");
 
-        // 构造 x = label || 0^48 的 key_id
-        // IV = master_salt XOR (label << 48)，填充到 16 字节
+        // 构造 x = label || 0^48 的 key_id。
+        // RFC 3711 将 112-bit master salt 放在 AES-CM 输入的高 112 位，
+        // 低 16 位留给 block counter。
         let mut iv = [0u8; 16];
-        // 将 master_salt（14 字节）放入 iv[2..16]，即右对齐留出 2 字节前缀
-        iv[2..16].copy_from_slice(&self.master_salt);
+        iv[..MASTER_SALT_LEN].copy_from_slice(&self.master_salt);
         // label 放在第 7 字节位置（从左起，对应 label << 48 在 112 位盐值空间中）
         iv[7] ^= label;
 
@@ -257,7 +257,7 @@ impl SrtpCryptoSuite {
             Aes128::new_from_slice(&self.master_key).expect("AES-128 密钥长度必须为 16 字节");
 
         let mut iv = [0u8; 16];
-        iv[2..16].copy_from_slice(&self.master_salt);
+        iv[..MASTER_SALT_LEN].copy_from_slice(&self.master_salt);
         iv[7] ^= label;
 
         let mut result = [0u8; SESSION_AUTH_KEY_LEN];
@@ -396,14 +396,9 @@ impl SrtpCryptoSuite {
 
         let cipher = Aes128::new_from_slice(&self.session_key).expect("会话密钥长度必须为 16 字节");
 
-        // 构造 IV（16 字节）
-        // IV 格式（RFC 3711）：
-        // 字节 0-3:   0x00000000
-        // 字节 4-7:   SSRC (网络字节序)
-        // 字节 8-13:  packet_index (48 位，网络字节序)
-        // 字节 14-15: block_counter (每块递增)
-        //
-        // 然后将 IV 与 session_salt（14 字节，左填充到 16 字节）异或
+        // 构造 IV（16 字节）。RFC 3711 AES_CM 使用：
+        // (session_salt << 16) XOR (SSRC << 64) XOR (packet_index << 16)
+        // 低 16 位保留给 block counter。
         let mut iv = [0u8; 16];
         // SSRC 在字节 4-7
         iv[4..8].copy_from_slice(&ssrc.to_be_bytes());
@@ -411,9 +406,9 @@ impl SrtpCryptoSuite {
         let pi_bytes = packet_index.to_be_bytes(); // 8 字节
         iv[8..14].copy_from_slice(&pi_bytes[2..8]); // 取低 48 位
 
-        // 与 session_salt 异或（session_salt 是 14 字节，放在 iv[2..16]）
+        // 与 session_salt 异或（session_salt 是 14 字节，放在 iv[0..14]）
         for i in 0..SESSION_SALT_LEN {
-            iv[2 + i] ^= self.session_salt[i];
+            iv[i] ^= self.session_salt[i];
         }
 
         // AES-CM：逐块加密计数器值，然后与明文异或
@@ -719,6 +714,70 @@ mod tests {
         // 解密
         let decrypted = suite.unprotect_rtp(&srtp_packet).unwrap();
         assert_eq!(decrypted, rtp_packet);
+    }
+
+    #[test]
+    fn test_aes_cm_iv_uses_left_aligned_session_salt() {
+        let suite = SrtpCryptoSuite {
+            master_key: [0u8; MASTER_KEY_LEN],
+            master_salt: [0u8; MASTER_SALT_LEN],
+            session_key: [0u8; SESSION_KEY_LEN],
+            session_salt: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+            session_auth_key: [0u8; SESSION_AUTH_KEY_LEN],
+            roc: 0,
+        };
+
+        let ssrc = 0x11223344u32;
+        let sequence = 0x5566u16;
+        let mut rtp_packet = Vec::new();
+        rtp_packet.push(0x80);
+        rtp_packet.push(0x00);
+        rtp_packet.extend_from_slice(&sequence.to_be_bytes());
+        rtp_packet.extend_from_slice(&160u32.to_be_bytes());
+        rtp_packet.extend_from_slice(&ssrc.to_be_bytes());
+        rtp_packet.extend_from_slice(&[0u8; 16]);
+
+        let encrypted_payload = suite.aes_cm_encrypt(ssrc, sequence as u64, &rtp_packet[12..]);
+
+        let mut expected_iv = [0u8; 16];
+        expected_iv[..SESSION_SALT_LEN].copy_from_slice(&suite.session_salt);
+        expected_iv[4..8]
+            .iter_mut()
+            .zip(ssrc.to_be_bytes())
+            .for_each(|(dst, src)| *dst ^= src);
+        let packet_index = (sequence as u64).to_be_bytes();
+        expected_iv[8..14]
+            .iter_mut()
+            .zip(&packet_index[2..8])
+            .for_each(|(dst, src)| *dst ^= *src);
+
+        let cipher = Aes128::new_from_slice(&suite.session_key).unwrap();
+        let mut aes_block = aes::Block::clone_from_slice(&expected_iv);
+        cipher.encrypt_block(&mut aes_block);
+
+        assert_eq!(&encrypted_payload[..16], &aes_block[..]);
+    }
+
+    #[test]
+    fn test_kdf_iv_uses_left_aligned_master_salt() {
+        let mut suite = SrtpCryptoSuite {
+            master_key: [0u8; MASTER_KEY_LEN],
+            master_salt: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+            session_key: [0u8; SESSION_KEY_LEN],
+            session_salt: [0u8; SESSION_SALT_LEN],
+            session_auth_key: [0u8; SESSION_AUTH_KEY_LEN],
+            roc: 0,
+        };
+        suite.derive_session_keys();
+
+        let mut expected_iv = [0u8; 16];
+        expected_iv[..MASTER_SALT_LEN].copy_from_slice(&suite.master_salt);
+
+        let cipher = Aes128::new_from_slice(&suite.master_key).unwrap();
+        let mut aes_block = aes::Block::clone_from_slice(&expected_iv);
+        cipher.encrypt_block(&mut aes_block);
+
+        assert_eq!(&suite.session_key[..], &aes_block[..]);
     }
 
     /// 测试认证标签篡改检测

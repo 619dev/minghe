@@ -234,6 +234,7 @@ pub async fn run_relay(
 
     let mut task1 = tokio::spawn(async move {
         let mut buf = [0u8; 2048];
+        let mut logged_first_forward = false;
         loop {
             match cs1.recv_from(&mut buf).await {
                 Ok((n, addr)) => {
@@ -277,6 +278,13 @@ pub async fn run_relay(
                         if let Some(outbound) = outbound {
                             if let Err(e) = cs2.send_to(&outbound, dest).await {
                                 tracing::debug!("转发到被叫失败: {}", e);
+                            } else if !logged_first_forward {
+                                tracing::info!(
+                                    "[{}] 主叫 -> 被叫 SRTP 首包已成功解密、重加密并转发到 {}",
+                                    cid1,
+                                    dest
+                                );
+                                logged_first_forward = true;
                             }
                         }
                     }
@@ -301,6 +309,7 @@ pub async fn run_relay(
 
     let mut task2 = tokio::spawn(async move {
         let mut buf = [0u8; 2048];
+        let mut logged_first_forward = false;
         loop {
             match cs3.recv_from(&mut buf).await {
                 Ok((n, addr)) => {
@@ -344,6 +353,13 @@ pub async fn run_relay(
                         if let Some(outbound) = outbound {
                             if let Err(e) = cs4.send_to(&outbound, dest).await {
                                 tracing::debug!("转发到主叫失败: {}", e);
+                            } else if !logged_first_forward {
+                                tracing::info!(
+                                    "[{}] 被叫 -> 主叫 SRTP 首包已成功解密、重加密并转发到 {}",
+                                    cid2,
+                                    dest
+                                );
+                                logged_first_forward = true;
                             }
                         }
                     }
