@@ -3,7 +3,7 @@
 # ============================================================
 
 # ---- 阶段 1: 构建 ----
-FROM rust:latest AS builder
+FROM rust:bookworm AS builder
 
 WORKDIR /build
 
