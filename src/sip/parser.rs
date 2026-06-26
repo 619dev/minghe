@@ -297,9 +297,17 @@ pub fn extract_contact_uri(request: &str) -> Option<String> {
                     return Some(value[start + 1..end].to_string());
                 }
             }
-            // 没有尖括号，取分号之前的部分
-            let uri = value.split(';').next().unwrap_or(value).trim();
-            return Some(uri.to_string());
+            // 没有尖括号时，保留 URI 参数（例如 ;transport=tls），只去掉
+            // Contact 头自身的 expires/q 等参数以及逗号后的其它 Contact。
+            let first_contact = value.split(',').next().unwrap_or(value).trim();
+            let lower_contact = first_contact.to_ascii_lowercase();
+            let mut end = first_contact.len();
+            for marker in [";expires=", ";q="] {
+                if let Some(pos) = lower_contact.find(marker) {
+                    end = end.min(pos);
+                }
+            }
+            return Some(first_contact[..end].trim().to_string());
         }
     }
     None
@@ -873,6 +881,20 @@ mod tests {
     fn test_extract_call_id() {
         let msg = "REGISTER sip:example.com SIP/2.0\r\nCall-ID: abc123@host\r\n\r\n";
         assert_eq!(extract_call_id(msg), Some("abc123@host".to_string()));
+    }
+
+    #[test]
+    fn test_extract_contact_uri_preserves_transport_param() {
+        let msg = concat!(
+            "REGISTER sip:example.com SIP/2.0\r\n",
+            "Contact: sip:1002@192.0.2.10:5061;transport=tls;expires=600\r\n",
+            "Content-Length: 0\r\n\r\n"
+        );
+
+        assert_eq!(
+            extract_contact_uri(msg),
+            Some("sip:1002@192.0.2.10:5061;transport=tls".to_string())
+        );
     }
 
     #[test]

@@ -243,10 +243,17 @@ impl Router {
             callee_key,
         );
 
+        let target_uri = registered_contact_uri(&callee_ext, &self.domain, &self.registrar);
+        tracing::debug!(
+            "转发 INVITE 到被叫 {} 的注册 Contact: {}",
+            callee_ext,
+            target_uri
+        );
+
         let rebuilt = rebuild_request_with_sdp(request_text, &new_sdp, &self.domain);
         let callee_invite = build_outbound_request_bytes(
             &rebuilt,
-            &server_contact_uri(&callee_ext, &self.domain),
+            &target_uri,
             &self.domain,
             &server_contact_uri(&caller_ext, &self.domain),
         );
@@ -365,7 +372,13 @@ impl Router {
                 }
                 n if n >= 400 => {
                     call.state = CallState::Terminated;
-                    tracing::info!("呼叫 {} 被拒绝: {}", call_id, status_code);
+                    tracing::warn!(
+                        "被叫 {} 返回失败响应: status={}, reason='{}', Call-ID={}",
+                        call.callee_ext,
+                        status_code,
+                        reason_phrase(response_text),
+                        call_id
+                    );
                 }
                 _ => {}
             }
@@ -425,7 +438,7 @@ impl Router {
                 180 => "Ringing",
                 183 => "Session Progress",
                 200 => "OK",
-                _ => "Unknown",
+                _ => reason_phrase(response_text),
             };
             build_forwarded_invite_response(
                 &original_invite,
@@ -442,10 +455,11 @@ impl Router {
                 180 => "Ringing",
                 183 => "Session Progress",
                 200 => "OK",
+                404 => "Not Found",
                 486 => "Busy Here",
                 487 => "Request Terminated",
                 603 => "Decline",
-                _ => "Unknown",
+                _ => reason_phrase(response_text),
             };
             build_forwarded_invite_response(
                 &original_invite,
@@ -930,6 +944,16 @@ fn first_header_line(msg: &str, name: &str, compact: Option<&str>) -> Option<Str
     header_lines(msg, name, compact).into_iter().next()
 }
 
+fn reason_phrase(response: &str) -> &str {
+    response
+        .lines()
+        .next()
+        .and_then(|line| line.splitn(3, ' ').nth(2))
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .unwrap_or("Unknown")
+}
+
 fn server_contact_uri(extension: &str, domain: &str) -> String {
     format!("sip:{}@{};transport=tls", extension, domain)
 }
@@ -953,11 +977,23 @@ fn extract_called_extension(request: &str) -> Option<String> {
 fn extract_srtp_crypto_from_sdp(sdp: &str) -> Option<SrtpCryptoSuite> {
     for line in sdp.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("a=crypto") || trimmed.starts_with("crypto:") {
-            match parse_crypto_attribute(trimmed)
-                .and_then(|(_, _, key)| SrtpCryptoSuite::from_sdes(&key))
-            {
-                Ok(crypto) => return Some(crypto),
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("a=crypto") || lower.starts_with("crypto:") {
+            match parse_crypto_attribute(trimmed) {
+                Ok((_, suite, key)) if suite.eq_ignore_ascii_case("AES_CM_128_HMAC_SHA1_80") => {
+                    match SrtpCryptoSuite::from_sdes(&key) {
+                        Ok(crypto) => return Some(crypto),
+                        Err(e) => {
+                            tracing::warn!("无法解析 SDP crypto 密钥 '{}': {}", trimmed, e);
+                        }
+                    }
+                }
+                Ok((_, suite, _)) => {
+                    tracing::warn!(
+                        "拒绝不支持的 SRTP crypto suite '{}': 当前仅支持 AES_CM_128_HMAC_SHA1_80",
+                        suite
+                    );
+                }
                 Err(e) => {
                     tracing::warn!("无法解析 SDP crypto 行 '{}': {}", trimmed, e);
                 }
@@ -1088,7 +1124,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_outbound_invite_keeps_dialed_user_in_request_uri() {
+    fn initial_outbound_invite_targets_registered_contact() {
         let invite = concat!(
             "INVITE sip:1002@example.com SIP/2.0\r\n",
             "Via: SIP/2.0/TLS caller.example.com;branch=z9hG4bKcaller\r\n",
@@ -1102,13 +1138,44 @@ mod tests {
 
         let rewritten = build_outbound_request(
             invite,
-            "sip:1002@example.com;transport=tls",
+            "sip:1002@callee-device.invalid;transport=tls",
             "example.com",
             "sip:1001@example.com;transport=tls",
         );
 
-        assert!(rewritten.starts_with("INVITE sip:1002@example.com;transport=tls SIP/2.0\r\n"));
-        assert!(!rewritten.starts_with("INVITE sips:1002@callee-device.invalid"));
+        assert!(rewritten
+            .starts_with("INVITE sip:1002@callee-device.invalid;transport=tls SIP/2.0\r\n"));
+        assert!(rewritten.contains("To: <sips:1002@example.com>\r\n"));
+    }
+
+    #[test]
+    fn forwarded_error_response_preserves_reason_phrase() {
+        let original_invite = concat!(
+            "INVITE sip:1002@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/TLS caller.example.com;branch=z9hG4bKcaller\r\n",
+            "From: <sips:1001@example.com>;tag=caller-tag\r\n",
+            "To: <sips:1002@example.com>\r\n",
+            "Call-ID: call-1\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Content-Length: 0\r\n\r\n"
+        );
+        let callee_response = concat!(
+            "SIP/2.0 404 Not Found\r\n",
+            "To: <sips:1002@example.com>;tag=callee-tag\r\n",
+            "Content-Length: 0\r\n\r\n"
+        );
+
+        let response = build_forwarded_invite_response(
+            original_invite,
+            callee_response,
+            404,
+            reason_phrase(callee_response),
+            "sip:1002@example.com;transport=tls",
+            "",
+        );
+        let response_text = String::from_utf8(response).unwrap();
+
+        assert!(response_text.starts_with("SIP/2.0 404 Not Found\r\n"));
     }
 
     #[test]
@@ -1152,6 +1219,23 @@ mod tests {
 
         assert!(rewritten.contains("m=audio 20000 RTP/SAVP 0 8 101"));
         assert!(rewritten.contains("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:SERVERKEY"));
+    }
+
+    #[test]
+    fn extracts_only_supported_srtp_crypto_suite() {
+        let supported = concat!(
+            "v=0\r\n",
+            "m=audio 4000 RTP/SAVP 0\r\n",
+            "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n"
+        );
+        let unsupported = concat!(
+            "v=0\r\n",
+            "m=audio 4000 RTP/SAVP 0\r\n",
+            "a=crypto:1 AES_CM_128_HMAC_SHA1_32 inline:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n"
+        );
+
+        assert!(extract_srtp_crypto_from_sdp(supported).is_some());
+        assert!(extract_srtp_crypto_from_sdp(unsupported).is_none());
     }
 
     #[test]
