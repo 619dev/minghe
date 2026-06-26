@@ -232,7 +232,9 @@ impl Router {
 
     /// 处理来自被叫的响应（100/180/200 等）
     ///
-    /// 将被叫的响应转发回主叫，并根据状态码更新呼叫状态。
+    /// 作为 B2BUA，使用原始 INVITE 的头部信息重建响应转发给主叫。
+    /// 被叫的响应中包含被叫的 Via 头部，不能直接转发给主叫，
+    /// 否则主叫会因 Via 不匹配而忽略响应。
     pub async fn handle_callee_response(&self, response_text: &str) {
         let call_id = match parser::extract_call_id(response_text) {
             Some(id) => id,
@@ -247,6 +249,7 @@ impl Router {
         let caller_writer;
         let caller_relay_port;
         let media_addr;
+        let original_invite;
 
         {
             let mut calls = self.active_calls.write().unwrap();
@@ -264,7 +267,6 @@ impl Router {
                 180 | 183 => {
                     call.state = CallState::Ringing;
                     tracing::info!("呼叫 {} 被叫振铃中", call_id);
-                    // 保存被叫 tag
                     if call.callee_tag.is_none() {
                         call.callee_tag = parser::extract_to_tag(response_text);
                     }
@@ -286,10 +288,13 @@ impl Router {
             caller_writer = call.caller_writer.clone();
             caller_relay_port = call.caller_relay_port;
             media_addr = self.media_addr.clone();
+            original_invite = call.original_invite.clone();
         };
 
-        // 修改响应的 SDP（如果有）：使用主叫侧的中继地址
+        // 用原始 INVITE 的头部重建响应给主叫
+        // 这样 Via、From、To、CSeq、Call-ID 都和主叫的原始请求匹配
         let forwarded_response = if let Some(body) = parser::extract_body(response_text) {
+            // 有 SDP body — 修改媒体地址并注入主叫侧 SRTP 密钥
             let caller_key = {
                 let calls = self.active_calls.read().unwrap();
                 if let Some(call) = calls.get(&call_id) {
@@ -310,12 +315,51 @@ impl Router {
                     caller_relay_port,
                     &caller_key,
                 );
-                rebuild_response_with_sdp(response_text, &new_sdp)
+                // 使用原始 INVITE 头部构建带 SDP 的响应
+                let reason = match status_code {
+                    100 => "Trying",
+                    180 => "Ringing",
+                    183 => "Session Progress",
+                    200 => "OK",
+                    _ => "Unknown",
+                };
+                parser::build_response_with_body(
+                    &original_invite,
+                    status_code,
+                    reason,
+                    &[],
+                    &new_sdp,
+                )
             } else {
-                response_text.as_bytes().to_vec()
+                // 无密钥，不修改 SDP，但仍使用原始 INVITE 头部重建
+                let reason = match status_code {
+                    100 => "Trying",
+                    180 => "Ringing",
+                    183 => "Session Progress",
+                    200 => "OK",
+                    _ => "Unknown",
+                };
+                parser::build_response_with_body(
+                    &original_invite,
+                    status_code,
+                    reason,
+                    &[],
+                    &body,
+                )
             }
         } else {
-            response_text.as_bytes().to_vec()
+            // 无 SDP body — 使用原始 INVITE 头部构建简单响应
+            let reason = match status_code {
+                100 => "Trying",
+                180 => "Ringing",
+                183 => "Session Progress",
+                200 => "OK",
+                486 => "Busy Here",
+                487 => "Request Terminated",
+                603 => "Decline",
+                _ => "Unknown",
+            };
+            parser::build_response(&original_invite, status_code, reason)
         };
 
         // 转发给主叫

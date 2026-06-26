@@ -585,13 +585,40 @@ pub fn is_response(msg: &str) -> bool {
 }
 
 /// 从 From/To 头部提取 URI
+///
+/// 支持标准格式和 SIP 紧凑格式：
+/// - From / f:
+/// - To / t:
+/// - Contact / m:
 pub fn extract_uri_from_header(msg: &str, header_name: &str) -> Option<String> {
     let search = format!("{}:", header_name.to_lowercase());
+    // SIP 紧凑格式映射
+    let compact = match header_name.to_lowercase().as_str() {
+        "from" => Some("f:"),
+        "to" => Some("t:"),
+        "contact" => Some("m:"),
+        "via" => Some("v:"),
+        "call-id" => Some("i:"),
+        _ => None,
+    };
+
     for line in msg.lines() {
         let trimmed = line.trim();
         let lower = trimmed.to_lowercase();
-        if lower.starts_with(&search) {
-            let value = &trimmed[header_name.len() + 1..];
+
+        let value_opt = if lower.starts_with(&search) {
+            Some(&trimmed[header_name.len() + 1..])
+        } else if let Some(c) = compact {
+            if lower.starts_with(c) {
+                Some(&trimmed[c.len()..])
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(value) = value_opt {
             // 尝试从尖括号中提取
             if let Some(start) = value.find('<') {
                 if let Some(end) = value.find('>') {
