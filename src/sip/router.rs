@@ -186,6 +186,34 @@ impl Router {
             }
         };
 
+        let invite_body = match parser::extract_body(request_text) {
+            Some(body) => body,
+            None => {
+                tracing::warn!(
+                    "拒绝 INVITE：强制 SRTP 模式要求初始 INVITE 携带 SDP (Call-ID={})",
+                    call_id
+                );
+                return parser::build_response(request_text, 488, "Not Acceptable Here");
+            }
+        };
+
+        let caller_remote_crypto = match extract_srtp_crypto_from_sdp(&invite_body) {
+            Some(crypto) => {
+                tracing::debug!(
+                    "主叫 {} 提供 a=crypto，使用强制 SRTP B2BUA 模式",
+                    caller_ext
+                );
+                crypto
+            }
+            None => {
+                tracing::warn!(
+                    "拒绝 INVITE：强制 SRTP 模式要求主叫 SDP 携带 a=crypto (Call-ID={})",
+                    call_id
+                );
+                return parser::build_response(request_text, 488, "Not Acceptable Here");
+            }
+        };
+
         // 分配媒体中继端口
         let relay_session = match self.media_manager.create_session(call_id.clone()) {
             Some(s) => s,
@@ -195,54 +223,27 @@ impl Router {
             }
         };
 
-        let caller_remote_crypto = parser::extract_body(request_text)
-            .as_deref()
-            .and_then(extract_srtp_crypto_from_sdp);
+        // 强制 SRTP：服务端分别向主叫、被叫声明自己的 SRTP 密钥。
+        let caller_local_crypto = SrtpCryptoSuite::new();
+        let callee_local_crypto = SrtpCryptoSuite::new();
 
-        let use_srtp = caller_remote_crypto.is_some();
-        if use_srtp {
-            tracing::debug!("主叫 {} 提供 a=crypto，使用 SRTP B2BUA 模式", caller_ext);
-        } else {
-            tracing::warn!("主叫 {} 未提供 a=crypto，使用普通 RTP 中继模式", caller_ext);
-        }
+        // 修改 SDP：替换媒体地址和端口，并强制声明 RTP/SAVP + SDES crypto
+        let callee_sdes = callee_local_crypto.to_sdes_attribute();
+        let callee_key = callee_sdes.split("inline:").nth(1).unwrap_or_default();
+        let new_sdp = parser::rewrite_sdp(
+            &invite_body,
+            &self.media_addr,
+            relay_session.callee_port,
+            callee_key,
+        );
 
-        // 如果主叫提供 SRTP，则服务端分别向主叫、被叫声明自己的 SRTP 密钥。
-        let caller_local_crypto = use_srtp.then(SrtpCryptoSuite::new);
-        let callee_local_crypto = use_srtp.then(SrtpCryptoSuite::new);
-
-        // 修改 SDP：替换媒体地址和端口，保留原始 RTP/SRTP 参数
-        let callee_invite = if let Some(body) = parser::extract_body(request_text) {
-            let new_sdp = if let Some(crypto) = &callee_local_crypto {
-                let callee_sdes = crypto.to_sdes_attribute();
-                let callee_key = callee_sdes.split("inline:").nth(1).unwrap_or_default();
-                parser::rewrite_sdp(
-                    &body,
-                    &self.media_addr,
-                    relay_session.callee_port,
-                    callee_key,
-                )
-            } else {
-                parser::rewrite_sdp_plain(&body, &self.media_addr, relay_session.callee_port)
-            };
-
-            // 重建 INVITE：替换 SDP body，并把 Request-URI 指向被叫的注册 Contact
-            let rebuilt = rebuild_request_with_sdp(request_text, &new_sdp, &self.domain);
-            build_outbound_request_bytes(
-                &rebuilt,
-                &server_contact_uri(&callee_ext, &self.domain),
-                &self.domain,
-                &server_contact_uri(&caller_ext, &self.domain),
-            )
-        } else {
-            // 无 SDP 的 INVITE（后续通过 re-INVITE 协商）
-            build_outbound_request(
-                request_text,
-                &server_contact_uri(&callee_ext, &self.domain),
-                &self.domain,
-                &server_contact_uri(&caller_ext, &self.domain),
-            )
-            .into_bytes()
-        };
+        let rebuilt = rebuild_request_with_sdp(request_text, &new_sdp, &self.domain);
+        let callee_invite = build_outbound_request_bytes(
+            &rebuilt,
+            &server_contact_uri(&callee_ext, &self.domain),
+            &self.domain,
+            &server_contact_uri(&caller_ext, &self.domain),
+        );
 
         // 存储呼叫信息
         let call_info = CallInfo {
@@ -257,10 +258,10 @@ impl Router {
             original_invite: request_text.to_string(),
             caller_writer: caller_writer.clone(),
             callee_writer: Some(callee_writer.clone()),
-            caller_remote_crypto,
-            caller_local_crypto,
+            caller_remote_crypto: Some(caller_remote_crypto),
+            caller_local_crypto: Some(caller_local_crypto),
             callee_remote_crypto: None,
-            callee_local_crypto,
+            callee_local_crypto: Some(callee_local_crypto),
             caller_relay_port: relay_session.caller_port,
             callee_relay_port: relay_session.callee_port,
             relay_started: false,
@@ -305,6 +306,7 @@ impl Router {
         let media_addr;
         let original_invite;
         let callee_ext;
+        let missing_required_srtp;
 
         {
             let mut calls = self.active_calls.write().unwrap();
@@ -327,28 +329,27 @@ impl Router {
                     }
                 }
                 200 => {
-                    if call.state != CallState::Established {
-                        call.state = CallState::Established;
-                        tracing::info!("呼叫 {} 已建立", call_id);
-                    }
                     if call.callee_tag.is_none() {
                         call.callee_tag = parser::extract_to_tag(response_text);
                     }
                     if call.callee_remote_contact.is_none() {
                         call.callee_remote_contact = parser::extract_contact_uri(response_text);
                     }
-                    if call.callee_local_crypto.is_some() && call.callee_remote_crypto.is_none() {
-                        if let Some(crypto) = parser::extract_body(response_text)
-                            .as_deref()
-                            .and_then(extract_srtp_crypto_from_sdp)
-                        {
-                            call.callee_remote_crypto = Some(crypto);
-                        } else {
-                            tracing::warn!(
-                                "被叫 200 OK 缺少可用 a=crypto，无法启动媒体中继: Call-ID={}",
-                                call_id
-                            );
+                    if let Some(crypto) = parser::extract_body(response_text)
+                        .as_deref()
+                        .and_then(extract_srtp_crypto_from_sdp)
+                    {
+                        call.callee_remote_crypto = Some(crypto);
+                        if call.state != CallState::Established {
+                            call.state = CallState::Established;
+                            tracing::info!("呼叫 {} 已建立（SRTP）", call_id);
                         }
+                    } else {
+                        call.state = CallState::Terminated;
+                        tracing::warn!(
+                            "被叫 200 OK 缺少 a=crypto，强制 SRTP 模式下拒绝建立: Call-ID={}",
+                            call_id
+                        );
                     }
                 }
                 n if n >= 400 => {
@@ -363,13 +364,23 @@ impl Router {
             media_addr = self.media_addr.clone();
             original_invite = call.original_invite.clone();
             callee_ext = call.callee_ext.clone();
+            missing_required_srtp = status_code == 200 && call.callee_remote_crypto.is_none();
         };
+
+        if missing_required_srtp {
+            let response = parser::build_response(&original_invite, 488, "Not Acceptable Here");
+            if let Err(e) = caller_writer.send(response).await {
+                tracing::error!("无法向主叫发送 SRTP 强制失败响应: {}", e);
+            }
+            self.cleanup_call(&call_id);
+            return;
+        }
 
         // 用原始 INVITE 的头部重建响应给主叫
         // 这样 Via、From、To、CSeq、Call-ID 都和主叫的原始请求匹配
         let forwarded_response = if let Some(body) = parser::extract_body(response_text) {
-            // 有 SDP body — 修改媒体地址和端口，保留原始 RTP/SRTP 参数
-            let caller_key = {
+            // 有 SDP body — 修改媒体地址和端口，并强制写回 SRTP 参数
+            let caller_key = match {
                 let calls = self.active_calls.read().unwrap();
                 if let Some(call) = calls.get(&call_id) {
                     call.caller_local_crypto.as_ref().map(|crypto| {
@@ -379,46 +390,40 @@ impl Router {
                 } else {
                     None
                 }
+            } {
+                Some(key) => key,
+                None => {
+                    tracing::error!(
+                        "内部错误：强制 SRTP 模式缺少主叫侧本地 crypto (Call-ID={})",
+                        call_id
+                    );
+                    let response =
+                        parser::build_response(&original_invite, 500, "Internal Server Error");
+                    if let Err(e) = caller_writer.send(response).await {
+                        tracing::error!("无法向主叫发送内部错误响应: {}", e);
+                    }
+                    self.cleanup_call(&call_id);
+                    return;
+                }
             };
 
-            if let Some(caller_key) = caller_key {
-                let new_sdp =
-                    parser::rewrite_sdp(&body, &media_addr, caller_relay_port, &caller_key);
-                // 使用原始 INVITE 头部构建带 SDP 的响应
-                let reason = match status_code {
-                    100 => "Trying",
-                    180 => "Ringing",
-                    183 => "Session Progress",
-                    200 => "OK",
-                    _ => "Unknown",
-                };
-                build_forwarded_invite_response(
-                    &original_invite,
-                    response_text,
-                    status_code,
-                    reason,
-                    &server_contact_uri(&callee_ext, &self.domain),
-                    &new_sdp,
-                )
-            } else {
-                // 普通 RTP 模式：只改写媒体地址和端口，不注入 crypto
-                let new_sdp = parser::rewrite_sdp_plain(&body, &media_addr, caller_relay_port);
-                let reason = match status_code {
-                    100 => "Trying",
-                    180 => "Ringing",
-                    183 => "Session Progress",
-                    200 => "OK",
-                    _ => "Unknown",
-                };
-                build_forwarded_invite_response(
-                    &original_invite,
-                    response_text,
-                    status_code,
-                    reason,
-                    &server_contact_uri(&callee_ext, &self.domain),
-                    &new_sdp,
-                )
-            }
+            let new_sdp = parser::rewrite_sdp(&body, &media_addr, caller_relay_port, &caller_key);
+            // 使用原始 INVITE 头部构建带 SDP 的响应
+            let reason = match status_code {
+                100 => "Trying",
+                180 => "Ringing",
+                183 => "Session Progress",
+                200 => "OK",
+                _ => "Unknown",
+            };
+            build_forwarded_invite_response(
+                &original_invite,
+                response_text,
+                status_code,
+                reason,
+                &server_contact_uri(&callee_ext, &self.domain),
+                &new_sdp,
+            )
         } else {
             // 无 SDP body — 使用原始 INVITE 头部构建简单响应
             let reason = match status_code {
@@ -456,9 +461,7 @@ impl Router {
             let should_start = {
                 let mut calls = self.active_calls.write().unwrap();
                 if let Some(call) = calls.get_mut(&call_id) {
-                    let has_required_crypto =
-                        call.callee_local_crypto.is_none() || call.callee_remote_crypto.is_some();
-                    if !call.relay_started && has_required_crypto {
+                    if !call.relay_started && call.callee_remote_crypto.is_some() {
                         call.relay_started = true;
                         true
                     } else {
@@ -859,7 +862,7 @@ fn build_forwarded_invite_response(
 
     let to = first_header_line(callee_response, "To", Some("t"))
         .or_else(|| first_header_line(original_invite, "To", Some("t")))
-        .unwrap_or_else(|| format!("To: <sips:{}>", contact_uri));
+        .unwrap_or_else(|| format!("To: <{}>", contact_uri));
     response.push_str(&to);
     response.push_str("\r\n");
 
@@ -913,7 +916,7 @@ fn first_header_line(msg: &str, name: &str, compact: Option<&str>) -> Option<Str
 }
 
 fn server_contact_uri(extension: &str, domain: &str) -> String {
-    format!("sips:{}@{};transport=tls", extension, domain)
+    format!("sip:{}@{};transport=tls", extension, domain)
 }
 
 fn registered_contact_uri(extension: &str, domain: &str, registrar: &RegistrarService) -> String {
@@ -979,13 +982,13 @@ mod tests {
             callee_response,
             200,
             "OK",
-            "sips:1002@example.com;transport=tls",
+            "sip:1002@example.com;transport=tls",
             "v=0\r\n",
         );
         let response_text = String::from_utf8(response).unwrap();
 
         assert!(response_text.contains("To: <sips:1002@example.com>;tag=callee-tag\r\n"));
-        assert!(response_text.contains("Contact: <sips:1002@example.com;transport=tls>\r\n"));
+        assert!(response_text.contains("Contact: <sip:1002@example.com;transport=tls>\r\n"));
         assert!(!response_text.contains("caller-tag;tag="));
     }
 
@@ -1005,15 +1008,15 @@ mod tests {
 
         let rewritten = build_outbound_request(
             invite,
-            "sips:1002@callee-device.invalid;transport=tls",
+            "sip:1002@callee-device.invalid;transport=tls",
             "example.com",
-            "sips:1001@example.com;transport=tls",
+            "sip:1001@example.com;transport=tls",
         );
 
         assert!(rewritten
-            .starts_with("INVITE sips:1002@callee-device.invalid;transport=tls SIP/2.0\r\n"));
+            .starts_with("INVITE sip:1002@callee-device.invalid;transport=tls SIP/2.0\r\n"));
         assert!(rewritten.contains("Via: SIP/2.0/TLS example.com;branch=z9hG4bK"));
-        assert!(rewritten.contains("Contact: <sips:1001@example.com;transport=tls>\r\n"));
+        assert!(rewritten.contains("Contact: <sip:1001@example.com;transport=tls>\r\n"));
         assert!(!rewritten.contains("caller-device.invalid"));
         assert!(!rewritten.contains("old-proxy.invalid"));
     }
@@ -1048,12 +1051,12 @@ mod tests {
 
         let rewritten = build_outbound_request(
             invite,
-            "sips:1002@example.com;transport=tls",
+            "sip:1002@example.com;transport=tls",
             "example.com",
-            "sips:1001@example.com;transport=tls",
+            "sip:1001@example.com;transport=tls",
         );
 
-        assert!(rewritten.starts_with("INVITE sips:1002@example.com;transport=tls SIP/2.0\r\n"));
+        assert!(rewritten.starts_with("INVITE sip:1002@example.com;transport=tls SIP/2.0\r\n"));
         assert!(!rewritten.starts_with("INVITE sips:1002@callee-device.invalid"));
     }
 
@@ -1071,16 +1074,32 @@ mod tests {
 
         let rewritten = build_outbound_request(
             ack,
-            "sips:1002@callee-device.invalid;transport=tls",
+            "sip:1002@callee-device.invalid;transport=tls",
             "example.com",
             "",
         );
 
         assert!(
-            rewritten.starts_with("ACK sips:1002@callee-device.invalid;transport=tls SIP/2.0\r\n")
+            rewritten.starts_with("ACK sip:1002@callee-device.invalid;transport=tls SIP/2.0\r\n")
         );
         assert!(rewritten.contains("Via: SIP/2.0/TLS example.com;branch=z9hG4bK"));
         assert!(!rewritten.contains("stale-contact.invalid"));
         assert!(rewritten.contains("To: <sips:1002@example.com>;tag=callee-tag\r\n"));
+    }
+
+    #[test]
+    fn forced_srtp_rewrite_injects_savp_and_crypto() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 192.168.1.10\r\n",
+            "c=IN IP4 192.168.1.10\r\n",
+            "m=audio 4000 RTP/AVP 0 8 101\r\n",
+            "a=rtpmap:0 PCMU/8000\r\n"
+        );
+
+        let rewritten = parser::rewrite_sdp(sdp, "203.0.113.10", 20000, "SERVERKEY");
+
+        assert!(rewritten.contains("m=audio 20000 RTP/SAVP 0 8 101"));
+        assert!(rewritten.contains("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:SERVERKEY"));
     }
 }

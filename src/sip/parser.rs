@@ -45,13 +45,14 @@ pub fn extract_extension(uri_str: &str) -> Option<String> {
         uri_str
     };
 
-    // 去掉 sip:、sips: 或 tel: 前缀
-    let without_scheme = if let Some(rest) = uri_part.strip_prefix("sip:") {
-        rest
-    } else if let Some(rest) = uri_part.strip_prefix("sips:") {
-        rest
-    } else if let Some(rest) = uri_part.strip_prefix("tel:") {
-        rest
+    // 去掉 sip:、sips: 或 tel: 前缀。URI scheme 大小写不敏感。
+    let lower_uri = uri_part.to_lowercase();
+    let without_scheme = if lower_uri.starts_with("sip:") {
+        &uri_part[4..]
+    } else if lower_uri.starts_with("sips:") {
+        &uri_part[5..]
+    } else if lower_uri.starts_with("tel:") {
+        &uri_part[4..]
     } else {
         uri_part
     };
@@ -689,10 +690,7 @@ pub fn rewrite_sdp_with_crypto(
             if found_media && !crypto_inserted && !line.starts_with("m=") {
                 if line.starts_with("a=crypto") {
                     if let Some(key) = crypto_key_b64 {
-                        result.push(format!(
-                            "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{}",
-                            key
-                        ));
+                        result.push(format!("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{}", key));
                     }
                     crypto_inserted = true;
                     continue;
@@ -704,18 +702,11 @@ pub fn rewrite_sdp_with_crypto(
 
     if found_media && !crypto_inserted {
         if let Some(key) = crypto_key_b64 {
-            result.push(format!(
-                "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{}",
-                key
-            ));
+            result.push(format!("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{}", key));
         }
     }
 
     result.join("\r\n")
-}
-
-pub fn rewrite_sdp_plain(sdp: &str, relay_addr: &str, relay_port: u16) -> String {
-    rewrite_sdp_with_crypto(sdp, relay_addr, relay_port, None)
 }
 
 #[cfg(test)]
@@ -751,6 +742,18 @@ mod tests {
         assert_eq!(
             extract_extension("sips:1002@example.com"),
             Some("1002".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_extension_case_insensitive_scheme() {
+        assert_eq!(
+            extract_extension("SIP:1002@example.com"),
+            Some("1002".to_string())
+        );
+        assert_eq!(
+            extract_extension("SIPS:1003@example.com"),
+            Some("1003".to_string())
         );
     }
 

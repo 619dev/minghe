@@ -11,13 +11,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
-use crate::config::AppConfig;
-use crate::media::relay::MediaRelayManager;
-use crate::tls::ReloadableTlsAcceptor;
 use super::parser;
 use super::registrar::RegistrarService;
 use super::router::Router;
 use super::transaction::TransactionManager;
+use crate::config::AppConfig;
+use crate::media::relay::MediaRelayManager;
+use crate::tls::ReloadableTlsAcceptor;
 
 /// 连接状态
 struct ConnectionState {
@@ -52,11 +52,7 @@ impl ServerState {
     }
 
     /// 注册连接
-    fn register_connection(
-        &self,
-        peer_addr: SocketAddr,
-        writer_tx: mpsc::Sender<Vec<u8>>,
-    ) {
+    fn register_connection(&self, peer_addr: SocketAddr, writer_tx: mpsc::Sender<Vec<u8>>) {
         let mut conns = self.connections.write().unwrap();
         conns.insert(
             peer_addr,
@@ -74,6 +70,22 @@ impl ServerState {
         if let Some(conn) = conns.get_mut(peer_addr) {
             conn.extension = Some(extension);
         }
+    }
+
+    /// 清除连接关联的分机号（显式注销后调用）
+    fn clear_connection_extension(&self, peer_addr: &SocketAddr) {
+        let mut conns = self.connections.write().unwrap();
+        if let Some(conn) = conns.get_mut(peer_addr) {
+            conn.extension = None;
+        }
+    }
+
+    /// 检查是否仍有其他连接关联到指定分机
+    fn has_connection_for_extension(&self, ext: &str) -> bool {
+        let conns = self.connections.read().unwrap();
+        conns
+            .values()
+            .any(|conn| conn.extension.as_deref() == Some(ext))
     }
 
     /// 获取连接的分机号
@@ -198,13 +210,7 @@ async fn handle_connection(
 
                     // 处理 SIP 消息
                     if let Ok(msg_text) = std::str::from_utf8(&msg_data) {
-                        process_sip_message(
-                            msg_text,
-                            peer_addr,
-                            writer_tx.clone(),
-                            &state,
-                        )
-                        .await;
+                        process_sip_message(msg_text, peer_addr, writer_tx.clone(), &state).await;
                     } else {
                         tracing::warn!("收到非 UTF-8 SIP 消息 来自 {}", peer_addr);
                     }
@@ -224,8 +230,9 @@ async fn handle_connection(
     let extension = state.remove_connection(&peer_addr);
     if let Some(ext) = &extension {
         tracing::info!("分机 {} 断开连接", ext);
-        state.registrar.unregister(ext);
-        state.router.unregister_writer(ext);
+        if !state.has_connection_for_extension(ext) {
+            state.router.unregister_writer(ext);
+        }
     }
 
     write_handle.abort();
@@ -259,13 +266,17 @@ async fn process_sip_message(
                 if let Ok(resp_text) = std::str::from_utf8(&response) {
                     if parser::extract_status_code(resp_text) == Some(200) {
                         // 提取分机号并关联连接
-                        if let Some(uri) =
-                            parser::extract_uri_from_header(msg_text, "To")
-                        {
+                        if let Some(uri) = parser::extract_uri_from_header(msg_text, "To") {
                             if let Some(ext) = parser::extract_extension(&uri) {
-                                state.set_connection_extension(&peer_addr, ext.clone());
-                                state.router.register_writer(&ext, writer_tx.clone());
-                                tracing::info!("分机 {} 已关联连接 {}", ext, peer_addr);
+                                if parser::extract_expires(msg_text) == Some(0) {
+                                    state.clear_connection_extension(&peer_addr);
+                                    state.router.unregister_writer(&ext);
+                                    tracing::info!("分机 {} 已显式注销连接 {}", ext, peer_addr);
+                                } else {
+                                    state.set_connection_extension(&peer_addr, ext.clone());
+                                    state.router.register_writer(&ext, writer_tx.clone());
+                                    tracing::info!("分机 {} 已关联连接 {}", ext, peer_addr);
+                                }
                             }
                         }
                     }
@@ -274,7 +285,10 @@ async fn process_sip_message(
                 let _ = writer_tx.send(response).await;
             }
             "INVITE" => {
-                let response = state.router.handle_invite(msg_text, writer_tx.clone()).await;
+                let response = state
+                    .router
+                    .handle_invite(msg_text, writer_tx.clone())
+                    .await;
                 let _ = writer_tx.send(response).await;
             }
             "ACK" => {
