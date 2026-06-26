@@ -733,9 +733,11 @@ fn should_strip_for_sdes_srtp(line: &str) -> bool {
     matches!(
         lower.as_str(),
         value
-            if value.starts_with("a=fingerprint:")
+            if value.starts_with("a=crypto:")
+                || value.starts_with("a=fingerprint:")
                 || value.starts_with("a=setup:")
                 || value.starts_with("a=connection:")
+                || value.starts_with("a=key-mgmt:")
                 || value.starts_with("a=ice-ufrag:")
                 || value.starts_with("a=ice-pwd:")
                 || value.starts_with("a=ice-options:")
@@ -947,5 +949,23 @@ mod tests {
         assert!(!rewritten.contains("a=setup"));
         assert!(!rewritten.contains("a=rtcp"));
         assert!(!rewritten.contains("a=candidate"));
+    }
+
+    #[test]
+    fn test_rewrite_sdp_strips_session_level_crypto() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 192.168.1.10\r\n",
+            "c=IN IP4 192.168.1.10\r\n",
+            "a=crypto:9 AES_CM_128_HMAC_SHA1_80 inline:SESSIONKEY\r\n",
+            "m=audio 4000 RTP/SAVP 0 8 101\r\n",
+            "a=rtpmap:0 PCMU/8000\r\n"
+        );
+
+        let rewritten = rewrite_sdp(sdp, "203.0.113.10", 20000, "SERVERKEY");
+
+        assert!(rewritten.contains("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:SERVERKEY"));
+        assert!(!rewritten.contains("SESSIONKEY"));
+        assert_eq!(rewritten.matches("a=crypto:").count(), 1);
     }
 }

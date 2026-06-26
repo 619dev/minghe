@@ -266,7 +266,12 @@ pub async fn run_relay(
                                     }
                                 },
                                 Err(e) => {
-                                    tracing::warn!("[{}] 主叫侧 SRTP 解密失败: {}", cid1, e);
+                                    tracing::warn!(
+                                        "[{}] 主叫侧 SRTP 解密失败: {}, {}",
+                                        cid1,
+                                        e,
+                                        describe_rtp_like_packet(packet)
+                                    );
                                     None
                                 }
                             },
@@ -341,7 +346,12 @@ pub async fn run_relay(
                                     }
                                 },
                                 Err(e) => {
-                                    tracing::warn!("[{}] 被叫侧 SRTP 解密失败: {}", cid2, e);
+                                    tracing::warn!(
+                                        "[{}] 被叫侧 SRTP 解密失败: {}, {}",
+                                        cid2,
+                                        e,
+                                        describe_rtp_like_packet(packet)
+                                    );
                                     None
                                 }
                             },
@@ -384,4 +394,27 @@ pub async fn run_relay(
 
     tracing::info!("媒体中继已停止: Call-ID={}", call_id_str);
     Ok(())
+}
+
+fn describe_rtp_like_packet(packet: &[u8]) -> String {
+    if packet.len() < 12 {
+        return format!("packet_len={}", packet.len());
+    }
+
+    let version = packet[0] >> 6;
+    let payload_byte = packet[1];
+    let payload_type = payload_byte & 0x7f;
+    let marker = packet[1] & 0x80 != 0;
+    let sequence = u16::from_be_bytes([packet[2], packet[3]]);
+    let ssrc = u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
+    format!(
+        "packet_len={}, rtp_version={}, marker={}, payload_byte={}, payload_type={}, seq={}, ssrc=0x{:08x}",
+        packet.len(),
+        version,
+        marker,
+        payload_byte,
+        payload_type,
+        sequence,
+        ssrc
+    )
 }
