@@ -184,6 +184,8 @@ pub async fn run_relay(
     callee_encrypt_crypto: Option<SrtpCryptoSuite>,
     callee_decrypt_crypto: Option<SrtpCryptoSuite>,
     caller_encrypt_crypto: Option<SrtpCryptoSuite>,
+    caller_initial_addr: Option<SocketAddr>,
+    callee_initial_addr: Option<SocketAddr>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 绑定两个 UDP socket
@@ -208,9 +210,16 @@ pub async fn run_relay(
     let caller_socket = std::sync::Arc::new(caller_socket);
     let callee_socket = std::sync::Arc::new(callee_socket);
 
-    // 共享的远端地址（通过地址学习获取）
-    let caller_remote = std::sync::Arc::new(tokio::sync::Mutex::new(None::<SocketAddr>));
-    let callee_remote = std::sync::Arc::new(tokio::sync::Mutex::new(None::<SocketAddr>));
+    if let Some(addr) = caller_initial_addr {
+        tracing::info!("[{}] 使用主叫 SDP 媒体地址: {}", call_id, addr);
+    }
+    if let Some(addr) = callee_initial_addr {
+        tracing::info!("[{}] 使用被叫 SDP 媒体地址: {}", call_id, addr);
+    }
+
+    // 共享的远端地址：优先使用 SDP 中声明的地址，收到实际 UDP 包后更新为源地址。
+    let caller_remote = std::sync::Arc::new(tokio::sync::Mutex::new(caller_initial_addr));
+    let callee_remote = std::sync::Arc::new(tokio::sync::Mutex::new(callee_initial_addr));
 
     let call_id_str = call_id.to_string();
 
@@ -231,15 +240,15 @@ pub async fn run_relay(
                     if n == 0 {
                         continue;
                     }
-                    // 学习主叫方地址
+                    // 学习/更新主叫方地址
                     {
                         let mut remote = cr1.lock().await;
-                        if remote.is_none() {
+                        if *remote != Some(addr) {
                             tracing::debug!("[{}] 学习到主叫方地址: {}", cid1, addr);
                             *remote = Some(addr);
                         }
                     }
-                    // SRTP 模式：解密 → 重加密；RTP 模式：透明转发
+                    // SRTP 模式：解密 → 重加密
                     let callee_addr = {
                         let remote = cr2.lock().await;
                         *remote
@@ -256,11 +265,14 @@ pub async fn run_relay(
                                     }
                                 },
                                 Err(e) => {
-                                    tracing::debug!("[{}] 主叫侧 SRTP 解密失败: {}", cid1, e);
+                                    tracing::warn!("[{}] 主叫侧 SRTP 解密失败: {}", cid1, e);
                                     None
                                 }
                             },
-                            _ => Some(packet.to_vec()),
+                            _ => {
+                                tracing::debug!("[{}] 缺少 SRTP crypto，丢弃主叫侧媒体包", cid1);
+                                None
+                            }
                         };
                         if let Some(outbound) = outbound {
                             if let Err(e) = cs2.send_to(&outbound, dest).await {
@@ -268,7 +280,7 @@ pub async fn run_relay(
                             }
                         }
                     }
-                    // 如果被叫地址未知，暂时丢弃包（等待被叫首先发包）
+                    // 如果被叫地址未知，暂时丢弃包（等待被叫包或 SDP 地址）
                 }
                 Err(e) => {
                     tracing::debug!("[{}] 主叫侧 UDP 读取错误: {}", cid1, e);
@@ -295,15 +307,15 @@ pub async fn run_relay(
                     if n == 0 {
                         continue;
                     }
-                    // 学习被叫方地址
+                    // 学习/更新被叫方地址
                     {
                         let mut remote = cr3.lock().await;
-                        if remote.is_none() {
+                        if *remote != Some(addr) {
                             tracing::debug!("[{}] 学习到被叫方地址: {}", cid2, addr);
                             *remote = Some(addr);
                         }
                     }
-                    // SRTP 模式：解密 → 重加密；RTP 模式：透明转发
+                    // SRTP 模式：解密 → 重加密
                     let caller_addr = {
                         let remote = cr4.lock().await;
                         *remote
@@ -320,11 +332,14 @@ pub async fn run_relay(
                                     }
                                 },
                                 Err(e) => {
-                                    tracing::debug!("[{}] 被叫侧 SRTP 解密失败: {}", cid2, e);
+                                    tracing::warn!("[{}] 被叫侧 SRTP 解密失败: {}", cid2, e);
                                     None
                                 }
                             },
-                            _ => Some(packet.to_vec()),
+                            _ => {
+                                tracing::debug!("[{}] 缺少 SRTP crypto，丢弃被叫侧媒体包", cid2);
+                                None
+                            }
                         };
                         if let Some(outbound) = outbound {
                             if let Err(e) = cs4.send_to(&outbound, dest).await {

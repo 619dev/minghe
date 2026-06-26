@@ -4,6 +4,7 @@
 //! 作为 B2BUA（Back-to-Back User Agent）工作，中继信令并管理媒体会话。
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 
@@ -58,6 +59,10 @@ pub struct CallInfo {
     pub callee_remote_crypto: Option<SrtpCryptoSuite>,
     /// 服务端转发给被叫的 offer 密钥（用于加密发给被叫的媒体）
     pub callee_local_crypto: Option<SrtpCryptoSuite>,
+    /// 主叫 SDP 中声明的媒体地址
+    pub caller_media_addr: Option<SocketAddr>,
+    /// 被叫 answer SDP 中声明的媒体地址
+    pub callee_media_addr: Option<SocketAddr>,
     /// 主叫侧中继端口
     pub caller_relay_port: u16,
     /// 被叫侧中继端口
@@ -213,6 +218,7 @@ impl Router {
                 return parser::build_response(request_text, 488, "Not Acceptable Here");
             }
         };
+        let caller_media_addr = extract_audio_media_addr_from_sdp(&invite_body);
 
         // 分配媒体中继端口
         let relay_session = match self.media_manager.create_session(call_id.clone()) {
@@ -262,6 +268,8 @@ impl Router {
             caller_local_crypto: Some(caller_local_crypto),
             callee_remote_crypto: None,
             callee_local_crypto: Some(callee_local_crypto),
+            caller_media_addr,
+            callee_media_addr: None,
             caller_relay_port: relay_session.caller_port,
             callee_relay_port: relay_session.callee_port,
             relay_started: false,
@@ -340,6 +348,9 @@ impl Router {
                         .and_then(extract_srtp_crypto_from_sdp)
                     {
                         call.callee_remote_crypto = Some(crypto);
+                        call.callee_media_addr = parser::extract_body(response_text)
+                            .as_deref()
+                            .and_then(extract_audio_media_addr_from_sdp);
                         if call.state != CallState::Established {
                             call.state = CallState::Established;
                             tracing::info!("呼叫 {} 已建立（SRTP）", call_id);
@@ -688,6 +699,8 @@ impl Router {
             let callee_encrypt_crypto = call.callee_local_crypto.clone();
             let callee_decrypt_crypto = call.callee_remote_crypto.clone();
             let caller_encrypt_crypto = call.caller_local_crypto.clone();
+            let caller_media_addr = call.caller_media_addr;
+            let callee_media_addr = call.callee_media_addr;
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
             self.media_manager.register_shutdown(call_id, shutdown_tx);
 
@@ -701,6 +714,8 @@ impl Router {
                     callee_encrypt_crypto,
                     callee_decrypt_crypto,
                     caller_encrypt_crypto,
+                    caller_media_addr,
+                    callee_media_addr,
                     shutdown_rx,
                 )
                 .await
@@ -952,6 +967,42 @@ fn extract_srtp_crypto_from_sdp(sdp: &str) -> Option<SrtpCryptoSuite> {
     None
 }
 
+fn extract_audio_media_addr_from_sdp(sdp: &str) -> Option<SocketAddr> {
+    let mut session_addr = None::<String>;
+    let mut audio_addr = None::<String>;
+    let mut audio_port = None::<u16>;
+    let mut in_audio = false;
+
+    for line in sdp.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("c=") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() >= 3 && parts[0].eq_ignore_ascii_case("IN") {
+                if in_audio {
+                    audio_addr = Some(parts[2].to_string());
+                } else {
+                    session_addr = Some(parts[2].to_string());
+                }
+            }
+        } else if trimmed.starts_with("m=") {
+            in_audio = trimmed.starts_with("m=audio");
+            if in_audio {
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                audio_port = parts
+                    .get(1)
+                    .and_then(|port| port.parse::<u16>().ok())
+                    .filter(|port| *port != 0);
+            }
+        }
+    }
+
+    let host = audio_addr.or(session_addr)?;
+    let host = host.split('/').next().unwrap_or(&host);
+    let port = audio_port?;
+    let ip = host.parse::<IpAddr>().ok()?;
+    Some(SocketAddr::new(ip, port))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1101,5 +1152,37 @@ mod tests {
 
         assert!(rewritten.contains("m=audio 20000 RTP/SAVP 0 8 101"));
         assert!(rewritten.contains("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:SERVERKEY"));
+    }
+
+    #[test]
+    fn extracts_audio_media_addr_from_sdp() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 192.168.1.10\r\n",
+            "c=IN IP4 192.168.1.10\r\n",
+            "m=audio 4000 RTP/SAVP 0 8 101\r\n",
+            "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:KEY\r\n"
+        );
+
+        assert_eq!(
+            extract_audio_media_addr_from_sdp(sdp),
+            Some("192.168.1.10:4000".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn media_level_connection_overrides_session_connection() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "c=IN IP4 192.168.1.10\r\n",
+            "m=video 5000 RTP/SAVP 96\r\n",
+            "m=audio 4000 RTP/SAVP 0 8 101\r\n",
+            "c=IN IP4 192.168.1.20\r\n"
+        );
+
+        assert_eq!(
+            extract_audio_media_addr_from_sdp(sdp),
+            Some("192.168.1.20:4000".parse().unwrap())
+        );
     }
 }
