@@ -654,10 +654,21 @@ pub fn rewrite_sdp_with_crypto(
     crypto_key_b64: Option<&str>,
 ) -> String {
     let mut result = Vec::new();
-    let mut found_media = false;
+    let mut in_audio = false;
+    let mut found_audio = false;
     let mut crypto_inserted = false;
 
     for line in sdp.lines() {
+        if line.starts_with("m=") {
+            if in_audio && !crypto_inserted {
+                if let Some(key) = crypto_key_b64 {
+                    result.push(format!("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{}", key));
+                }
+            }
+            in_audio = line.starts_with("m=audio");
+            crypto_inserted = false;
+        }
+
         if line.starts_with("c=") {
             // 替换连接信息为服务器中继地址
             result.push(format!("c=IN IP4 {}", relay_addr));
@@ -667,11 +678,7 @@ pub fn rewrite_sdp_with_crypto(
             if parts.len() >= 4 {
                 // m=audio <port> <proto> <formats...>
                 let proto = if crypto_key_b64.is_some() {
-                    if parts[2].contains("SAVP") {
-                        parts[2].to_string()
-                    } else {
-                        parts[2].replace("AVP", "SAVP")
-                    }
+                    "RTP/SAVP".to_string()
                 } else {
                     parts[2].to_string()
                 };
@@ -682,31 +689,55 @@ pub fn rewrite_sdp_with_crypto(
                     proto,
                     formats.join(" ")
                 ));
-                found_media = true;
+                found_audio = true;
             } else {
                 result.push(line.to_string());
             }
         } else {
-            if found_media && !crypto_inserted && !line.starts_with("m=") {
-                if line.starts_with("a=crypto") {
+            if crypto_key_b64.is_some() && should_strip_for_sdes_srtp(line) {
+                continue;
+            }
+
+            if in_audio && line.starts_with("a=crypto") {
+                if !crypto_inserted {
                     if let Some(key) = crypto_key_b64 {
                         result.push(format!("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{}", key));
+                        crypto_inserted = true;
                     }
-                    crypto_inserted = true;
-                    continue;
                 }
+                continue;
             }
             result.push(line.to_string());
         }
     }
 
-    if found_media && !crypto_inserted {
+    if in_audio && found_audio && !crypto_inserted {
         if let Some(key) = crypto_key_b64 {
             result.push(format!("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{}", key));
         }
     }
 
     result.join("\r\n")
+}
+
+fn should_strip_for_sdes_srtp(line: &str) -> bool {
+    let lower = line.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        value
+            if value.starts_with("a=fingerprint:")
+                || value.starts_with("a=setup:")
+                || value.starts_with("a=connection:")
+                || value.starts_with("a=ice-ufrag:")
+                || value.starts_with("a=ice-pwd:")
+                || value.starts_with("a=ice-options:")
+                || value.starts_with("a=candidate:")
+                || value.starts_with("a=end-of-candidates")
+                || value.starts_with("a=remote-candidates:")
+                || value.starts_with("a=rtcp:")
+                || value.starts_with("a=rtcp-mux")
+                || value.starts_with("a=rtcp-rsize")
+    )
 }
 
 #[cfg(test)]
@@ -860,5 +891,39 @@ mod tests {
         assert!(rewritten.contains("m=audio 20000 RTP/SAVP 0 8 101"));
         assert!(rewritten.contains("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:SERVERKEY"));
         assert!(!rewritten.contains("CLIENTKEY"));
+    }
+
+    #[test]
+    fn test_rewrite_sdp_strips_dtls_ice_and_rtcp_for_sdes_srtp() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 192.168.1.10\r\n",
+            "c=IN IP4 192.168.1.10\r\n",
+            "a=ice-ufrag:abc\r\n",
+            "a=ice-pwd:def\r\n",
+            "a=fingerprint:sha-256 00:11:22\r\n",
+            "a=setup:actpass\r\n",
+            "m=audio 4000 RTP/SAVPF 0 8 101\r\n",
+            "a=rtcp:4001 IN IP4 192.168.1.10\r\n",
+            "a=rtcp-mux\r\n",
+            "a=candidate:1 1 UDP 2130706431 192.168.1.10 4000 typ host\r\n",
+            "a=crypto:2 AES_CM_128_HMAC_SHA1_80 inline:CLIENTKEY\r\n",
+            "a=rtpmap:0 PCMU/8000\r\n"
+        );
+
+        let rewritten = rewrite_sdp(sdp, "203.0.113.10", 20000, "SERVERKEY");
+
+        assert!(rewritten.contains("m=audio 20000 RTP/SAVP 0 8 101"));
+        assert!(rewritten.contains("c=IN IP4 203.0.113.10"));
+        assert!(rewritten.contains("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:SERVERKEY"));
+        assert!(rewritten.contains("a=rtpmap:0 PCMU/8000"));
+        assert!(!rewritten.contains("RTP/SAVPF"));
+        assert!(!rewritten.contains("CLIENTKEY"));
+        assert!(!rewritten.contains("a=ice-ufrag"));
+        assert!(!rewritten.contains("a=ice-pwd"));
+        assert!(!rewritten.contains("a=fingerprint"));
+        assert!(!rewritten.contains("a=setup"));
+        assert!(!rewritten.contains("a=rtcp"));
+        assert!(!rewritten.contains("a=candidate"));
     }
 }

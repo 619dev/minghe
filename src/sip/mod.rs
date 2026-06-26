@@ -7,8 +7,8 @@
 //! - `router`: 呼叫路由（INVITE/BYE/CANCEL/ACK）
 //! - `transaction`: 事务管理
 
-pub mod server;
 pub mod parser;
 pub mod registrar;
 pub mod router;
+pub mod server;
 pub mod transaction;

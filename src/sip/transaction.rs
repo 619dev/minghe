@@ -80,7 +80,12 @@ impl TransactionManager {
     pub fn update_state(&self, branch: &str, new_state: TransactionState) {
         let mut map = self.transactions.write().unwrap();
         if let Some(tx) = map.get_mut(branch) {
-            tracing::debug!("事务 {} 状态更新: {:?} -> {:?}", branch, tx.state, new_state);
+            tracing::debug!(
+                "事务 {} 状态更新: {:?} -> {:?}",
+                branch,
+                tx.state,
+                new_state
+            );
             tx.state = new_state;
         }
     }

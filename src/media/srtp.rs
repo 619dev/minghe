@@ -164,10 +164,7 @@ impl SrtpCryptoSuite {
         key_salt.extend_from_slice(&self.master_key);
         key_salt.extend_from_slice(&self.master_salt);
         let encoded = BASE64.encode(&key_salt);
-        format!(
-            "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{}",
-            encoded
-        )
+        format!("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{}", encoded)
     }
 
     /// 生成 SDP crypto 行
@@ -206,7 +203,8 @@ impl SrtpCryptoSuite {
         self.session_key = self.prf_derive(LABEL_CIPHER_KEY, SESSION_KEY_LEN);
         // 盐值只有 14 字节，先派生 16 字节再截断
         let salt_full: [u8; SESSION_KEY_LEN] = self.prf_derive(LABEL_SALT, SESSION_KEY_LEN);
-        self.session_salt.copy_from_slice(&salt_full[..SESSION_SALT_LEN]);
+        self.session_salt
+            .copy_from_slice(&salt_full[..SESSION_SALT_LEN]);
         // 认证密钥需要 20 字节，可能需要多个 AES 块
         self.session_auth_key = self.prf_derive_auth(LABEL_AUTH_KEY, SESSION_AUTH_KEY_LEN);
     }
@@ -396,8 +394,7 @@ impl SrtpCryptoSuite {
             return Vec::new();
         }
 
-        let cipher =
-            Aes128::new_from_slice(&self.session_key).expect("会话密钥长度必须为 16 字节");
+        let cipher = Aes128::new_from_slice(&self.session_key).expect("会话密钥长度必须为 16 字节");
 
         // 构造 IV（16 字节）
         // IV 格式（RFC 3711）：
@@ -533,17 +530,11 @@ pub fn parse_crypto_attribute(line: &str) -> Result<(u32, String, String)> {
     }
 
     let key_with_params = &key_part[7..]; // 跳过 "inline:"
-    // 密钥可能包含 |lifetime|mki 等参数，只取第一部分
-    let key = key_with_params
-        .split('|')
-        .next()
-        .unwrap_or("")
-        .to_string();
+                                          // 密钥可能包含 |lifetime|mki 等参数，只取第一部分
+    let key = key_with_params.split('|').next().unwrap_or("").to_string();
 
     if key.is_empty() {
-        return Err(SrtpError::CryptoAttributeParseError(
-            "密钥为空".to_string(),
-        ));
+        return Err(SrtpError::CryptoAttributeParseError("密钥为空".to_string()));
     }
 
     Ok((tag, suite, key))
@@ -614,18 +605,14 @@ impl RtpHeader {
         // 检查 CSRC 列表是否完整
         let csrc_end = RTP_HEADER_MIN_LEN + (csrc_count as usize) * 4;
         if data.len() < csrc_end {
-            return Err(SrtpError::InvalidRtpPacket(
-                "CSRC 列表不完整".to_string(),
-            ));
+            return Err(SrtpError::InvalidRtpPacket("CSRC 列表不完整".to_string()));
         }
 
         // 解析扩展头
         let extension_length = if extension {
             let ext_start = csrc_end;
             if data.len() < ext_start + 4 {
-                return Err(SrtpError::InvalidRtpPacket(
-                    "扩展头不完整".to_string(),
-                ));
+                return Err(SrtpError::InvalidRtpPacket("扩展头不完整".to_string()));
             }
             // 扩展头前 2 字节是 profile-specific，后 2 字节是长度（32 位字为单位）
             let ext_len = u16::from_be_bytes([data[ext_start + 2], data[ext_start + 3]]);
@@ -724,7 +711,10 @@ mod tests {
         assert_eq!(srtp_packet.len(), rtp_packet.len() + AUTH_TAG_LEN);
 
         // 加密后的载荷应该不同于原始载荷
-        assert_ne!(&srtp_packet[12..srtp_packet.len() - AUTH_TAG_LEN], b"Hello, SRTP!");
+        assert_ne!(
+            &srtp_packet[12..srtp_packet.len() - AUTH_TAG_LEN],
+            b"Hello, SRTP!"
+        );
 
         // 解密
         let decrypted = suite.unprotect_rtp(&srtp_packet).unwrap();
@@ -769,7 +759,8 @@ mod tests {
     /// 测试解析带生命周期参数的加密属性
     #[test]
     fn test_parse_crypto_attribute_with_lifetime() {
-        let line = "crypto:2 AES_CM_128_HMAC_SHA1_80 inline:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA|2^31";
+        let line =
+            "crypto:2 AES_CM_128_HMAC_SHA1_80 inline:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA|2^31";
         let (tag, suite, key) = parse_crypto_attribute(line).unwrap();
         assert_eq!(tag, 2);
         assert_eq!(suite, "AES_CM_128_HMAC_SHA1_80");

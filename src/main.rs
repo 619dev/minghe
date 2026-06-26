@@ -115,9 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tls_acceptor = tls_acceptor.clone();
 
         tokio::spawn(async move {
-            if let Err(e) =
-                sip::server::run(config, tls_acceptor, registrar, media_manager).await
-            {
+            if let Err(e) = sip::server::run(config, tls_acceptor, registrar, media_manager).await {
                 tracing::error!("SIP 服务器运行错误: {}", e);
             }
         })

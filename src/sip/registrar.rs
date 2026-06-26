@@ -3,7 +3,7 @@
 //! 管理分机的注册状态，实现 SIP Digest 认证。
 //! 支持 REGISTER 请求的完整处理流程：认证挑战 → 验证 → 注册/注销。
 
-use md5::{Md5, Digest};
+use md5::{Digest, Md5};
 use rand::Rng;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -130,7 +130,9 @@ impl RegistrarService {
         if ext_num < self.range_start || ext_num > self.range_end {
             tracing::warn!(
                 "分机号 {} 不在有效范围 {}-{} 内",
-                extension, self.range_start, self.range_end
+                extension,
+                self.range_start,
+                self.range_end
             );
             return parser::build_response(request_text, 403, "Forbidden");
         }
@@ -226,7 +228,10 @@ impl RegistrarService {
                     request_text,
                     200,
                     "OK",
-                    &[("Contact", &contact_header), ("Expires", &expires.to_string())],
+                    &[
+                        ("Contact", &contact_header),
+                        ("Expires", &expires.to_string()),
+                    ],
                 )
             }
         }
@@ -443,7 +448,13 @@ fn validate_digest(
 
     tracing::debug!(
         "Digest 验证: username={}, realm={}, qop={:?}, HA1={}, HA2={}, expected={}, received={}",
-        username, realm, qop, ha1, ha2, expected, response
+        username,
+        realm,
+        qop,
+        ha1,
+        ha2,
+        expected,
+        response
     );
 
     expected.to_lowercase() == response.to_lowercase()
@@ -497,7 +508,10 @@ mod tests {
         // response = MD5(HA1:nonce:nc:cnonce:auth:HA2)
         let ha1 = md5_hex("1001:minghe.local:minghe@2024");
         let ha2 = md5_hex("REGISTER:sip:minghe.local");
-        let response = md5_hex(&format!("{}:testnonce:00000001:clientnonce:auth:{}", ha1, ha2));
+        let response = md5_hex(&format!(
+            "{}:testnonce:00000001:clientnonce:auth:{}",
+            ha1, ha2
+        ));
 
         assert!(validate_digest(
             "1001",

@@ -84,10 +84,7 @@ pub fn setup_tls(
             }
         }
 
-        tracing::info!(
-            "正在生成自签名证书（主体: {}）...",
-            host
-        );
+        tracing::info!("正在生成自签名证书（主体: {}）...", host);
         generate_and_save_cert(host)?
     } else {
         tracing::info!(
@@ -147,7 +144,10 @@ pub fn start_cert_renewal_task(
                     Ok((certs, key)) => match build_acceptor(certs, key) {
                         Ok(new_acceptor) => {
                             tls_acceptor.reload(new_acceptor);
-                            tracing::info!("证书自动续期成功！新证书有效期 {} 天", CERT_VALIDITY_DAYS);
+                            tracing::info!(
+                                "证书自动续期成功！新证书有效期 {} 天",
+                                CERT_VALIDITY_DAYS
+                            );
                         }
                         Err(e) => {
                             tracing::error!("证书续期后构建 TLS acceptor 失败: {}", e);
@@ -192,11 +192,7 @@ fn is_cert_expiring_soon(pem_data: &[u8]) -> bool {
                 .unwrap_or_default();
             let age_days = age.as_secs() as i64 / 86400;
             let days_remaining = CERT_VALIDITY_DAYS - age_days;
-            tracing::debug!(
-                "证书已使用 {} 天，估计剩余 {} 天",
-                age_days,
-                days_remaining
-            );
+            tracing::debug!("证书已使用 {} 天，估计剩余 {} 天", age_days, days_remaining);
             return days_remaining < RENEWAL_DAYS_BEFORE;
         }
     }
@@ -209,10 +205,7 @@ fn is_cert_expiring_soon(pem_data: &[u8]) -> bool {
 /// 生成自签名证书并保存到 certs/ 目录
 fn generate_and_save_cert(
     host: &str,
-) -> Result<
-    (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>),
-    Box<dyn std::error::Error>,
-> {
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), Box<dyn std::error::Error>> {
     let (cert_pem, key_pem) = generate_self_signed(host)?;
 
     // 保存到 certs/ 目录
@@ -226,10 +219,8 @@ fn generate_and_save_cert(
     let key_file_path = certs_dir.join("server.key");
     let expiry_file_path = certs_dir.join("server.expiry");
 
-    std::fs::write(&cert_file_path, &cert_pem)
-        .map_err(|e| format!("无法写入证书文件: {}", e))?;
-    std::fs::write(&key_file_path, &key_pem)
-        .map_err(|e| format!("无法写入私钥文件: {}", e))?;
+    std::fs::write(&cert_file_path, &cert_pem).map_err(|e| format!("无法写入证书文件: {}", e))?;
+    std::fs::write(&key_file_path, &key_pem).map_err(|e| format!("无法写入私钥文件: {}", e))?;
 
     // 保存过期时间戳
     let expiry_ts = std::time::SystemTime::now()
@@ -254,9 +245,7 @@ fn generate_and_save_cert(
 }
 
 /// 使用 rcgen 生成自签名证书
-fn generate_self_signed(
-    host: &str,
-) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
+fn generate_self_signed(host: &str) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
     use rcgen::{CertificateParams, DnType, KeyPair, SanType};
     use std::net::IpAddr;
     use time::{Duration, OffsetDateTime};
@@ -270,26 +259,29 @@ fn generate_self_signed(
         if host != "127.0.0.1" {
             subject_alt_names.push(SanType::IpAddress("127.0.0.1".parse::<IpAddr>().unwrap()));
         }
-        subject_alt_names.push(SanType::DnsName("localhost".try_into().map_err(|e| {
-            format!("localhost 域名转换失败: {}", e)
-        })?));
+        subject_alt_names.push(SanType::DnsName(
+            "localhost"
+                .try_into()
+                .map_err(|e| format!("localhost 域名转换失败: {}", e))?,
+        ));
     } else {
         tracing::info!("生成域名证书模式: {}", host);
-        subject_alt_names.push(SanType::DnsName(host.try_into().map_err(|e| {
-            format!("域名 '{}' 格式无效: {}", host, e)
-        })?));
-        subject_alt_names.push(SanType::DnsName("localhost".try_into().map_err(|e| {
-            format!("localhost 域名转换失败: {}", e)
-        })?));
+        subject_alt_names.push(SanType::DnsName(
+            host.try_into()
+                .map_err(|e| format!("域名 '{}' 格式无效: {}", host, e))?,
+        ));
+        subject_alt_names.push(SanType::DnsName(
+            "localhost"
+                .try_into()
+                .map_err(|e| format!("localhost 域名转换失败: {}", e))?,
+        ));
         subject_alt_names.push(SanType::IpAddress("127.0.0.1".parse::<IpAddr>().unwrap()));
     }
 
     let mut params = CertificateParams::default();
     params.subject_alt_names = subject_alt_names;
 
-    params
-        .distinguished_name
-        .push(DnType::CommonName, host);
+    params.distinguished_name.push(DnType::CommonName, host);
     params
         .distinguished_name
         .push(DnType::OrganizationName, "MingHe SIP Server");
@@ -298,8 +290,7 @@ fn generate_self_signed(
     params.not_before = now;
     params.not_after = now + Duration::days(CERT_VALIDITY_DAYS);
 
-    let key_pair = KeyPair::generate()
-        .map_err(|e| format!("密钥对生成失败: {}", e))?;
+    let key_pair = KeyPair::generate().map_err(|e| format!("密钥对生成失败: {}", e))?;
 
     let cert = params
         .self_signed(&key_pair)
@@ -330,9 +321,7 @@ fn parse_cert_pem(
 }
 
 /// 从 PEM 字节解析私钥
-fn parse_key_pem(
-    pem_data: &[u8],
-) -> Result<PrivateKeyDer<'static>, Box<dyn std::error::Error>> {
+fn parse_key_pem(pem_data: &[u8]) -> Result<PrivateKeyDer<'static>, Box<dyn std::error::Error>> {
     let mut reader = BufReader::new(pem_data);
     let key = rustls_pemfile::private_key(&mut reader)
         .map_err(|e| format!("私钥 PEM 解析失败: {}", e))?
@@ -344,8 +333,8 @@ fn parse_key_pem(
 fn load_certs_from_path(
     path: &str,
 ) -> Result<Vec<CertificateDer<'static>>, Box<dyn std::error::Error>> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| format!("无法打开证书文件 '{}': {}", path, e))?;
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("无法打开证书文件 '{}': {}", path, e))?;
     let mut reader = BufReader::new(file);
 
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
@@ -361,11 +350,9 @@ fn load_certs_from_path(
 }
 
 /// 从文件路径加载私钥
-fn load_key_from_path(
-    path: &str,
-) -> Result<PrivateKeyDer<'static>, Box<dyn std::error::Error>> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| format!("无法打开私钥文件 '{}': {}", path, e))?;
+fn load_key_from_path(path: &str) -> Result<PrivateKeyDer<'static>, Box<dyn std::error::Error>> {
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("无法打开私钥文件 '{}': {}", path, e))?;
     let mut reader = BufReader::new(file);
 
     let key = rustls_pemfile::private_key(&mut reader)
@@ -381,14 +368,13 @@ fn build_acceptor(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<TlsAcceptor, Box<dyn std::error::Error>> {
-    let tls_config = ServerConfig::builder_with_provider(
-        Arc::new(rustls::crypto::ring::default_provider()),
-    )
-    .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
-    .map_err(|e| format!("TLS 协议版本配置失败: {}", e))?
-    .with_no_client_auth()
-    .with_single_cert(certs, key)
-    .map_err(|e| format!("TLS ServerConfig 构建失败: {}", e))?;
+    let tls_config =
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
+            .map_err(|e| format!("TLS 协议版本配置失败: {}", e))?
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| format!("TLS ServerConfig 构建失败: {}", e))?;
 
     Ok(TlsAcceptor::from(Arc::new(tls_config)))
 }

@@ -78,8 +78,8 @@ impl AppConfig {
     pub fn load(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("无法读取配置文件 '{}': {}", path, e))?;
-        let config: AppConfig = toml::from_str(&content)
-            .map_err(|e| format!("配置文件解析错误 '{}': {}", path, e))?;
+        let config: AppConfig =
+            toml::from_str(&content).map_err(|e| format!("配置文件解析错误 '{}': {}", path, e))?;
 
         // 基本校验
         if config.extensions.range_start > config.extensions.range_end {
@@ -117,16 +117,19 @@ impl AppConfig {
         // 校验独立密码中的分机号是否在范围内
         for (ext_str, _) in &config.passwords {
             if let Ok(ext_num) = ext_str.parse::<u32>() {
-                if ext_num < config.extensions.range_start || ext_num > config.extensions.range_end {
+                if ext_num < config.extensions.range_start || ext_num > config.extensions.range_end
+                {
                     tracing::warn!(
                         "密码配置中的分机 {} 不在有效范围 {}-{} 内，将被忽略",
-                        ext_str, config.extensions.range_start, config.extensions.range_end
+                        ext_str,
+                        config.extensions.range_start,
+                        config.extensions.range_end
                     );
                 }
             } else {
-                return Err(format!(
-                    "密码配置中的分机号 '{}' 格式无效（应为数字）", ext_str
-                ).into());
+                return Err(
+                    format!("密码配置中的分机号 '{}' 格式无效（应为数字）", ext_str).into(),
+                );
             }
         }
 
