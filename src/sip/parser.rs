@@ -612,7 +612,8 @@ pub fn extract_uri_from_header(msg: &str, header_name: &str) -> Option<String> {
 ///
 /// 将 SDP 中的 c= 行替换为服务器中继地址，
 /// 将 m= 行的端口替换为中继端口，
-/// 并在 m= 行之后添加 a=crypto 行。
+/// 并强制启用 SRTP（RTP/SAVP）+ 注入服务器侧 crypto 密钥。
+/// 服务器作为 SRTP B2BUA，每侧使用独立密钥，中继负责解密→重加密。
 pub fn rewrite_sdp(
     sdp: &str,
     relay_addr: &str,
@@ -650,9 +651,8 @@ pub fn rewrite_sdp(
                 result.push(line.to_string());
             }
         } else {
-            // 在 m= 行之后、下一个 m= 行之前插入 crypto
+            // 在 m= 行之后，替换或注入 crypto
             if found_media && !crypto_inserted && !line.starts_with("m=") {
-                // 检查是否已有 a=crypto 行
                 if line.starts_with("a=crypto") {
                     // 替换现有的 crypto 行
                     result.push(format!(

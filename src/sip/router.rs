@@ -502,7 +502,7 @@ impl Router {
         let calls = self.active_calls.read().unwrap();
         if let Some(call) = calls.get(call_id) {
             tracing::info!(
-                "启动媒体中继: Call-ID={}, 主叫端口={}, 被叫端口={}",
+                "启动 SRTP B2BUA 媒体中继: Call-ID={}, 主叫端口={}, 被叫端口={}",
                 call_id, call.caller_relay_port, call.callee_relay_port
             );
 
@@ -511,6 +511,8 @@ impl Router {
             let callee_port = call.callee_relay_port;
             let media_addr = self.media_addr.clone();
             let call_id_clone = call_id.to_string();
+            let caller_crypto = call.caller_crypto.clone();
+            let callee_crypto = call.callee_crypto.clone();
 
             tokio::spawn(async move {
                 if let Err(e) = crate::media::relay::run_relay(
@@ -518,6 +520,8 @@ impl Router {
                     &media_addr,
                     caller_port,
                     callee_port,
+                    caller_crypto,
+                    callee_crypto,
                 ).await {
                     tracing::error!("媒体中继错误 ({}): {}", call_id_clone, e);
                 }
