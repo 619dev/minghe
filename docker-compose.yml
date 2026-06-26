@@ -52,8 +52,8 @@ services:
     deploy:
       resources:
         limits:
-          # CPU 限制
-          cpus: "${CPU_LIMIT:-2.0}"
+          # CPU 限制。默认 1.0，兼容 1 核 VPS；多核机器可通过 CPU_LIMIT 调高。
+          cpus: "${CPU_LIMIT:-1.0}"
           # 内存限制
           memory: "${MEM_LIMIT:-512M}"
         reservations:

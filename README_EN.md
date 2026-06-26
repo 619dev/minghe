@@ -248,6 +248,8 @@ cargo build --release
 | `SIP_PORT` | `5061` | SIP TLS port mapping |
 | `RTP_PORT_START` | `20000` | RTP port range start |
 | `RTP_PORT_END` | `30000` | RTP port range end |
+| `CPU_LIMIT` | `1.0` | Docker Compose CPU limit; works on 1-core VPS by default, can be increased on larger hosts |
+| `MEM_LIMIT` | `512M` | Docker Compose memory limit |
 | `TZ` | `Asia/Shanghai` | Container timezone |
 
 ## License

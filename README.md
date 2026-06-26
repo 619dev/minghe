@@ -248,6 +248,8 @@ cargo build --release
 | `SIP_PORT` | `5061` | SIP TLS 端口映射 |
 | `RTP_PORT_START` | `20000` | RTP 端口范围起始 |
 | `RTP_PORT_END` | `30000` | RTP 端口范围结束 |
+| `CPU_LIMIT` | `1.0` | Docker Compose CPU 限制；1 核 VPS 可直接使用，多核机器可调高 |
+| `MEM_LIMIT` | `512M` | Docker Compose 内存限制 |
 | `TZ` | `Asia/Shanghai` | 容器时区 |
 
 ## 许可证
