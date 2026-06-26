@@ -146,12 +146,13 @@ impl Router {
             caller_ext, callee_ext, call_id
         );
 
-        // 检查是否为 INVITE 重传（同一 Call-ID 已在处理中）
+        // 如果同一 Call-ID 已有活跃呼叫（上次呼叫残留），先清理
         {
             let calls = self.active_calls.read().unwrap();
             if calls.contains_key(&call_id) {
-                tracing::debug!("INVITE 重传，忽略: Call-ID={}", call_id);
-                return parser::build_response(request_text, 100, "Trying");
+                tracing::warn!("发现残留呼叫，清理: Call-ID={}", call_id);
+                drop(calls); // 释放读锁
+                self.cleanup_call(&call_id);
             }
         }
 

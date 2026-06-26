@@ -92,8 +92,17 @@ impl MediaRelayManager {
         }
     }
 
-    /// 创建新的中继会话
+    /// 创建新的中继会话（如果已存在则返回现有会话）
     pub fn create_session(&self, session_id: String) -> Option<RelaySession> {
+        // 检查是否已有此会话
+        {
+            let sessions = self.sessions.lock().unwrap();
+            if let Some(existing) = sessions.get(&session_id) {
+                tracing::debug!("媒体中继会话已存在: {}", session_id);
+                return Some(existing.clone());
+            }
+        }
+
         let caller_port = self.allocate_port_pair()?;
         let callee_port = self.allocate_port_pair()?;
 
