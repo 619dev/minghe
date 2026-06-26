@@ -32,6 +32,12 @@ struct DigestParams {
     nonce: String,
     uri: String,
     response: String,
+    /// qop 值（如 "auth"），客户端可能不发送
+    qop: Option<String>,
+    /// nonce 计数器（十六进制字符串，如 "00000001"）
+    nc: Option<String>,
+    /// 客户端随机数
+    cnonce: Option<String>,
 }
 
 /// 注册服务
@@ -171,6 +177,9 @@ impl RegistrarService {
                     &params.uri,
                     "REGISTER",
                     &params.response,
+                    params.qop.as_deref(),
+                    params.nc.as_deref(),
+                    params.cnonce.as_deref(),
                 ) {
                     tracing::warn!("分机 {} 认证失败（来自 {}）", extension, from_addr);
                     return parser::build_response(request_text, 403, "Forbidden");
@@ -326,6 +335,9 @@ fn parse_authorization(header_value: &str) -> Option<DigestParams> {
     let mut nonce = String::new();
     let mut uri = String::new();
     let mut response = String::new();
+    let mut qop: Option<String> = None;
+    let mut nc: Option<String> = None;
+    let mut cnonce: Option<String> = None;
 
     // 解析 key="value" 对
     // 需要处理值中可能包含逗号的情况（如 URI）
@@ -340,7 +352,10 @@ fn parse_authorization(header_value: &str) -> Option<DigestParams> {
                 "nonce" => nonce = val,
                 "uri" => uri = val,
                 "response" => response = val,
-                _ => {} // 忽略其他参数 (algorithm, qop, nc, cnonce 等)
+                "qop" => qop = Some(val),
+                "nc" => nc = Some(val),
+                "cnonce" => cnonce = Some(val),
+                _ => {} // 忽略其他参数 (algorithm 等)
             }
         }
     }
@@ -355,6 +370,9 @@ fn parse_authorization(header_value: &str) -> Option<DigestParams> {
         nonce,
         uri,
         response,
+        qop,
+        nc,
+        cnonce,
     })
 }
 
@@ -387,11 +405,13 @@ fn split_digest_params(input: &str) -> Vec<String> {
 
 /// 验证 Digest 认证响应
 ///
-/// RFC 2617 算法：
+/// 支持两种算法：
+/// - RFC 2069（无 qop）：response = MD5(HA1:nonce:HA2)
+/// - RFC 2617（qop=auth）：response = MD5(HA1:nonce:nc:cnonce:qop:HA2)
+///
 /// ```text
 /// HA1 = MD5(username:realm:password)
 /// HA2 = MD5(method:uri)
-/// response = MD5(HA1:nonce:HA2)
 /// ```
 fn validate_digest(
     username: &str,
@@ -401,14 +421,29 @@ fn validate_digest(
     uri: &str,
     method: &str,
     response: &str,
+    qop: Option<&str>,
+    nc: Option<&str>,
+    cnonce: Option<&str>,
 ) -> bool {
     let ha1 = md5_hex(&format!("{}:{}:{}", username, realm, password));
     let ha2 = md5_hex(&format!("{}:{}", method, uri));
-    let expected = md5_hex(&format!("{}:{}:{}", ha1, nonce, ha2));
+
+    let expected = match qop {
+        Some("auth") => {
+            // RFC 2617 qop=auth: response = MD5(HA1:nonce:nc:cnonce:qop:HA2)
+            let nc = nc.unwrap_or("00000001");
+            let cnonce = cnonce.unwrap_or("");
+            md5_hex(&format!("{}:{}:{}:{}:auth:{}", ha1, nonce, nc, cnonce, ha2))
+        }
+        _ => {
+            // RFC 2069（无 qop）：response = MD5(HA1:nonce:HA2)
+            md5_hex(&format!("{}:{}:{}", ha1, nonce, ha2))
+        }
+    };
 
     tracing::debug!(
-        "Digest 验证: username={}, realm={}, HA1={}, HA2={}, expected={}, received={}",
-        username, realm, ha1, ha2, expected, response
+        "Digest 验证: username={}, realm={}, qop={:?}, HA1={}, HA2={}, expected={}, received={}",
+        username, realm, qop, ha1, ha2, expected, response
     );
 
     expected.to_lowercase() == response.to_lowercase()
@@ -433,8 +468,8 @@ mod tests {
     }
 
     #[test]
-    fn test_digest_validation() {
-        // 手动计算:
+    fn test_digest_validation_no_qop() {
+        // RFC 2069（无 qop）:
         // HA1 = MD5("1001:minghe.local:minghe@2024")
         // HA2 = MD5("REGISTER:sip:minghe.local")
         // expected = MD5(HA1:testnonce:HA2)
@@ -450,6 +485,31 @@ mod tests {
             "sip:minghe.local",
             "REGISTER",
             &response,
+            None,
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn test_digest_validation_qop_auth() {
+        // RFC 2617（qop=auth）:
+        // response = MD5(HA1:nonce:nc:cnonce:auth:HA2)
+        let ha1 = md5_hex("1001:minghe.local:minghe@2024");
+        let ha2 = md5_hex("REGISTER:sip:minghe.local");
+        let response = md5_hex(&format!("{}:testnonce:00000001:clientnonce:auth:{}", ha1, ha2));
+
+        assert!(validate_digest(
+            "1001",
+            "minghe.local",
+            "minghe@2024",
+            "testnonce",
+            "sip:minghe.local",
+            "REGISTER",
+            &response,
+            Some("auth"),
+            Some("00000001"),
+            Some("clientnonce"),
         ));
     }
 
@@ -467,6 +527,9 @@ mod tests {
             "sip:minghe.local",
             "REGISTER",
             &response,
+            None,
+            None,
+            None,
         ));
     }
 
