@@ -219,23 +219,45 @@ fn generate_and_save_cert(
     let key_file_path = certs_dir.join("server.key");
     let expiry_file_path = certs_dir.join("server.expiry");
 
-    std::fs::write(&cert_file_path, &cert_pem).map_err(|e| format!("无法写入证书文件: {}", e))?;
-    std::fs::write(&key_file_path, &key_pem).map_err(|e| format!("无法写入私钥文件: {}", e))?;
+    let mut persisted = true;
+    if let Err(e) = std::fs::write(&cert_file_path, &cert_pem) {
+        persisted = false;
+        tracing::warn!(
+            "无法写入证书文件 {}: {}。将使用内存中的临时证书继续启动；请检查 /app/certs 挂载目录权限。",
+            cert_file_path.display(),
+            e
+        );
+    }
+    if let Err(e) = std::fs::write(&key_file_path, &key_pem) {
+        persisted = false;
+        tracing::warn!(
+            "无法写入私钥文件 {}: {}。将使用内存中的临时证书继续启动；请检查 /app/certs 挂载目录权限。",
+            key_file_path.display(),
+            e
+        );
+    }
 
-    // 保存过期时间戳
-    let expiry_ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
-        + CERT_VALIDITY_DAYS * 86400;
-    std::fs::write(&expiry_file_path, expiry_ts.to_string())
-        .map_err(|e| format!("无法写入过期时间文件: {}", e))?;
+    if persisted {
+        // 保存过期时间戳
+        let expiry_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
+            + CERT_VALIDITY_DAYS * 86400;
+        if let Err(e) = std::fs::write(&expiry_file_path, expiry_ts.to_string()) {
+            tracing::warn!(
+                "无法写入证书过期时间文件 {}: {}",
+                expiry_file_path.display(),
+                e
+            );
+        }
 
-    tracing::info!(
-        "自签名证书已保存: 证书={}, 私钥={}",
-        cert_file_path.display(),
-        key_file_path.display()
-    );
+        tracing::info!(
+            "自签名证书已保存: 证书={}, 私钥={}",
+            cert_file_path.display(),
+            key_file_path.display()
+        );
+    }
 
     // 解析 PEM 数据
     let certs = parse_cert_pem(&cert_pem)?;

@@ -33,9 +33,9 @@ RUN apt-get update && \
         && \
     rm -rf /var/lib/apt/lists/*
 
-# 创建非 root 用户
-RUN groupadd -r minghe && \
-    useradd -r -g minghe -d /app -s /sbin/nologin minghe
+# 创建固定 UID/GID 的非 root 用户，便于宿主机 bind mount 目录授权
+RUN groupadd -r -g 10001 minghe && \
+    useradd -r -u 10001 -g minghe -d /app -s /sbin/nologin minghe
 
 WORKDIR /app
 

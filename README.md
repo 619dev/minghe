@@ -24,7 +24,7 @@
 
 ```bash
 # 1. 准备配置
-mkdir -p config certs
+mkdir -p config
 cp config.template.toml config/config.toml
 
 # 2. 编辑配置（至少修改 host 和 default_password）
@@ -36,6 +36,8 @@ docker compose up -d
 # 4. 查看日志
 docker compose logs -f
 ```
+
+> Docker Compose 默认使用命名卷保存自签名证书，不需要手动创建 `certs` 目录。
 
 > ⚠️ 本项目不再提供 Zeabur 模板。SIP 信令使用 TCP/TLS，但语音媒体使用 SRTP/UDP，必须保证配置中的 UDP 端口范围能以相同公网端口直达容器。只支持 HTTP/TCP 转发、随机外部端口或无法开放 UDP 端口范围的平台不适合直接部署本服务。
 
@@ -196,6 +198,10 @@ minghe/
 
 ```bash
 docker pull facilisvelox/minghe:latest
+
+# 如果使用宿主机目录挂载证书，请先确保容器内 minghe 用户可写。
+mkdir -p config certs
+sudo chown -R 10001:10001 certs
 
 docker run -d \
   --name minghe-sip \

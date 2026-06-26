@@ -24,7 +24,7 @@
 
 ```bash
 # 1. Prepare configuration
-mkdir -p config certs
+mkdir -p config
 cp config.template.toml config/config.toml
 
 # 2. Edit config (at minimum, change host and default_password)
@@ -36,6 +36,8 @@ docker compose up -d
 # 4. View logs
 docker compose logs -f
 ```
+
+> Docker Compose uses a named volume for self-signed certificates by default, so you do not need to create a local `certs` directory.
 
 > ⚠️ This project no longer ships a Zeabur template. SIP signaling uses TCP/TLS, but audio media uses SRTP/UDP. The configured UDP port range must be reachable from clients on the same public port numbers advertised in SDP. Platforms that only support HTTP/TCP forwarding, random external ports, or no UDP port ranges are not suitable for direct deployment.
 
@@ -196,6 +198,10 @@ minghe/
 
 ```bash
 docker pull facilisvelox/minghe:latest
+
+# If you bind-mount a host certificate directory, make it writable by the in-container minghe user first.
+mkdir -p config certs
+sudo chown -R 10001:10001 certs
 
 docker run -d \
   --name minghe-sip \

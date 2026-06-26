@@ -35,8 +35,8 @@ services:
     volumes:
       # 配置文件
       - ./config:/app/config:ro
-      # TLS 证书持久化（自签名证书自动生成在这里）
-      - ./certs:/app/certs
+      # TLS 证书持久化（使用 Docker 命名卷，避免宿主机目录权限导致证书无法写入）
+      - certs:/app/certs
 
     # 环境变量
     environment:
@@ -75,3 +75,6 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  certs:
