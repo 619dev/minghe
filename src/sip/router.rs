@@ -141,10 +141,9 @@ impl Router {
             .and_then(|uri| parser::extract_extension(&uri))
             .unwrap_or_default();
 
-        // 提取被叫分机号（从 Request-URI）
-        let callee_ext = parser::extract_request_uri(request_text)
-            .and_then(|uri| parser::extract_extension(&uri))
-            .unwrap_or_default();
+        // 提取被叫分机号。多数客户端放在 Request-URI；部分客户端会把
+        // Request-URI 指向服务器本身，把真实被叫放在 To 头里。
+        let callee_ext = extract_called_extension(request_text).unwrap_or_default();
 
         let call_id = parser::extract_call_id(request_text).unwrap_or_default();
         let caller_tag = parser::extract_from_tag(request_text).unwrap_or_default();
@@ -168,7 +167,13 @@ impl Router {
 
         // 检查被叫是否在线
         if !self.registrar.is_registered(&callee_ext) {
-            tracing::warn!("被叫 {} 不在线", callee_ext);
+            tracing::warn!(
+                "被叫 {} 不在线或未注册，返回 404: request_uri={:?}, to={:?}, online_count={}",
+                callee_ext,
+                parser::extract_request_uri(request_text),
+                parser::extract_uri_from_header(request_text, "To"),
+                self.registrar.online_count()
+            );
             return parser::build_response(request_text, 404, "Not Found");
         }
 
@@ -224,7 +229,7 @@ impl Router {
             let rebuilt = rebuild_request_with_sdp(request_text, &new_sdp, &self.domain);
             build_outbound_request_bytes(
                 &rebuilt,
-                &registered_contact_uri(&callee_ext, &self.domain, &self.registrar),
+                &server_contact_uri(&callee_ext, &self.domain),
                 &self.domain,
                 &server_contact_uri(&caller_ext, &self.domain),
             )
@@ -232,7 +237,7 @@ impl Router {
             // 无 SDP 的 INVITE（后续通过 re-INVITE 协商）
             build_outbound_request(
                 request_text,
-                &registered_contact_uri(&callee_ext, &self.domain, &self.registrar),
+                &server_contact_uri(&callee_ext, &self.domain),
                 &self.domain,
                 &server_contact_uri(&caller_ext, &self.domain),
             )
@@ -918,6 +923,15 @@ fn registered_contact_uri(extension: &str, domain: &str, registrar: &RegistrarSe
         .unwrap_or_else(|| server_contact_uri(extension, domain))
 }
 
+fn extract_called_extension(request: &str) -> Option<String> {
+    parser::extract_request_uri(request)
+        .and_then(|uri| parser::extract_extension(&uri))
+        .or_else(|| {
+            parser::extract_uri_from_header(request, "To")
+                .and_then(|uri| parser::extract_extension(&uri))
+        })
+}
+
 fn extract_srtp_crypto_from_sdp(sdp: &str) -> Option<SrtpCryptoSuite> {
     for line in sdp.lines() {
         let trimmed = line.trim();
@@ -1002,6 +1016,45 @@ mod tests {
         assert!(rewritten.contains("Contact: <sips:1001@example.com;transport=tls>\r\n"));
         assert!(!rewritten.contains("caller-device.invalid"));
         assert!(!rewritten.contains("old-proxy.invalid"));
+    }
+
+    #[test]
+    fn called_extension_falls_back_to_to_header() {
+        let invite = concat!(
+            "INVITE sips:pbx.example.com;transport=tls SIP/2.0\r\n",
+            "Via: SIP/2.0/TLS caller.example.com;branch=z9hG4bKcaller\r\n",
+            "From: <sips:1001@example.com>;tag=caller-tag\r\n",
+            "To: <sips:1002@example.com>\r\n",
+            "Call-ID: call-1\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Content-Length: 0\r\n\r\n"
+        );
+
+        assert_eq!(extract_called_extension(invite), Some("1002".to_string()));
+    }
+
+    #[test]
+    fn initial_outbound_invite_keeps_dialed_user_in_request_uri() {
+        let invite = concat!(
+            "INVITE sip:1002@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/TLS caller.example.com;branch=z9hG4bKcaller\r\n",
+            "From: <sips:1001@example.com>;tag=caller-tag\r\n",
+            "To: <sips:1002@example.com>\r\n",
+            "Contact: <sips:1001@caller-device.invalid;transport=tls>\r\n",
+            "Call-ID: call-1\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Content-Length: 0\r\n\r\n"
+        );
+
+        let rewritten = build_outbound_request(
+            invite,
+            "sips:1002@example.com;transport=tls",
+            "example.com",
+            "sips:1001@example.com;transport=tls",
+        );
+
+        assert!(rewritten.starts_with("INVITE sips:1002@example.com;transport=tls SIP/2.0\r\n"));
+        assert!(!rewritten.starts_with("INVITE sips:1002@callee-device.invalid"));
     }
 
     #[test]
