@@ -174,20 +174,16 @@ impl MediaRelayManager {
 /// 为指定的呼叫建立两个 UDP socket，双向中继 SRTP 数据包。
 /// 采用"地址学习"机制：从首个收到的数据包中获取远端地址。
 ///
-/// SRTP B2BUA 模式：
-/// - 主叫 → 服务器：用主叫原始 offer 中的密钥解密
-/// - 服务器 → 被叫：用服务端转发给被叫的 offer 密钥重新加密
-/// - 被叫 → 服务器：用被叫 answer 中的密钥解密
-/// - 服务器 → 主叫：用服务端转发给主叫的 answer 密钥重新加密
+/// SRTP B2BUA 模式下会解密并重加密；普通 RTP 模式下透明转发。
 pub async fn run_relay(
     call_id: &str,
     _media_addr: &str,
     caller_port: u16,
     callee_port: u16,
-    caller_decrypt_crypto: SrtpCryptoSuite,
-    callee_encrypt_crypto: SrtpCryptoSuite,
-    callee_decrypt_crypto: SrtpCryptoSuite,
-    caller_encrypt_crypto: SrtpCryptoSuite,
+    caller_decrypt_crypto: Option<SrtpCryptoSuite>,
+    callee_encrypt_crypto: Option<SrtpCryptoSuite>,
+    callee_decrypt_crypto: Option<SrtpCryptoSuite>,
+    caller_encrypt_crypto: Option<SrtpCryptoSuite>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 绑定两个 UDP socket
@@ -203,7 +199,7 @@ pub async fn run_relay(
         .map_err(|e| format!("无法绑定被叫侧 UDP 端口 {}: {}", callee_bind, e))?;
 
     tracing::info!(
-        "SRTP B2BUA 媒体中继已启动: {} (主叫侧) <-> {} (被叫侧), Call-ID={}",
+        "RTP/SRTP 媒体中继已启动: {} (主叫侧) <-> {} (被叫侧), Call-ID={}",
         caller_bind,
         callee_bind,
         call_id
@@ -243,26 +239,32 @@ pub async fn run_relay(
                             *remote = Some(addr);
                         }
                     }
-                    // SRTP 解密 → 重加密 → 转发到被叫方
+                    // SRTP 模式：解密 → 重加密；RTP 模式：透明转发
                     let callee_addr = {
                         let remote = cr2.lock().await;
                         *remote
                     };
                     if let Some(dest) = callee_addr {
                         let packet = &buf[..n];
-                        match decrypt_caller.unprotect_rtp(packet) {
-                            Ok(rtp) => match encrypt_callee.protect_rtp(&rtp) {
-                                Ok(srtp) => {
-                                    if let Err(e) = cs2.send_to(&srtp, dest).await {
-                                        tracing::debug!("转发到被叫失败: {}", e);
+                        let outbound = match (&decrypt_caller, &encrypt_callee) {
+                            (Some(decrypt), Some(encrypt)) => match decrypt.unprotect_rtp(packet) {
+                                Ok(rtp) => match encrypt.protect_rtp(&rtp) {
+                                    Ok(srtp) => Some(srtp),
+                                    Err(e) => {
+                                        tracing::debug!("[{}] 主叫侧重加密失败: {}", cid1, e);
+                                        None
                                     }
-                                }
+                                },
                                 Err(e) => {
-                                    tracing::debug!("[{}] 主叫侧重加密失败: {}", cid1, e);
+                                    tracing::debug!("[{}] 主叫侧 SRTP 解密失败: {}", cid1, e);
+                                    None
                                 }
                             },
-                            Err(e) => {
-                                tracing::debug!("[{}] 主叫侧 SRTP 解密失败: {}", cid1, e);
+                            _ => Some(packet.to_vec()),
+                        };
+                        if let Some(outbound) = outbound {
+                            if let Err(e) = cs2.send_to(&outbound, dest).await {
+                                tracing::debug!("转发到被叫失败: {}", e);
                             }
                         }
                     }
@@ -301,26 +303,32 @@ pub async fn run_relay(
                             *remote = Some(addr);
                         }
                     }
-                    // SRTP 解密 → 重加密 → 转发到主叫方
+                    // SRTP 模式：解密 → 重加密；RTP 模式：透明转发
                     let caller_addr = {
                         let remote = cr4.lock().await;
                         *remote
                     };
                     if let Some(dest) = caller_addr {
                         let packet = &buf[..n];
-                        match decrypt_callee.unprotect_rtp(packet) {
-                            Ok(rtp) => match encrypt_caller.protect_rtp(&rtp) {
-                                Ok(srtp) => {
-                                    if let Err(e) = cs4.send_to(&srtp, dest).await {
-                                        tracing::debug!("转发到主叫失败: {}", e);
+                        let outbound = match (&decrypt_callee, &encrypt_caller) {
+                            (Some(decrypt), Some(encrypt)) => match decrypt.unprotect_rtp(packet) {
+                                Ok(rtp) => match encrypt.protect_rtp(&rtp) {
+                                    Ok(srtp) => Some(srtp),
+                                    Err(e) => {
+                                        tracing::debug!("[{}] 被叫侧重加密失败: {}", cid2, e);
+                                        None
                                     }
-                                }
+                                },
                                 Err(e) => {
-                                    tracing::debug!("[{}] 被叫侧重加密失败: {}", cid2, e);
+                                    tracing::debug!("[{}] 被叫侧 SRTP 解密失败: {}", cid2, e);
+                                    None
                                 }
                             },
-                            Err(e) => {
-                                tracing::debug!("[{}] 被叫侧 SRTP 解密失败: {}", cid2, e);
+                            _ => Some(packet.to_vec()),
+                        };
+                        if let Some(outbound) = outbound {
+                            if let Err(e) = cs4.send_to(&outbound, dest).await {
+                                tracing::debug!("转发到主叫失败: {}", e);
                             }
                         }
                     }

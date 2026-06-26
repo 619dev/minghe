@@ -47,13 +47,13 @@ pub struct CallInfo {
     /// 被叫侧写入通道
     pub callee_writer: Option<mpsc::Sender<Vec<u8>>>,
     /// 主叫原始 offer 中的 SRTP 密钥（用于解密主叫发来的媒体）
-    pub caller_remote_crypto: SrtpCryptoSuite,
+    pub caller_remote_crypto: Option<SrtpCryptoSuite>,
     /// 服务端转发给主叫的 answer 密钥（用于加密发给主叫的媒体）
-    pub caller_local_crypto: SrtpCryptoSuite,
+    pub caller_local_crypto: Option<SrtpCryptoSuite>,
     /// 被叫 answer 中的 SRTP 密钥（用于解密被叫发来的媒体）
     pub callee_remote_crypto: Option<SrtpCryptoSuite>,
     /// 服务端转发给被叫的 offer 密钥（用于加密发给被叫的媒体）
-    pub callee_local_crypto: SrtpCryptoSuite,
+    pub callee_local_crypto: Option<SrtpCryptoSuite>,
     /// 主叫侧中继端口
     pub caller_relay_port: u16,
     /// 被叫侧中继端口
@@ -186,35 +186,30 @@ impl Router {
             }
         };
 
-        let caller_remote_crypto = match parser::extract_body(request_text)
+        let caller_remote_crypto = parser::extract_body(request_text)
             .as_deref()
-            .and_then(extract_srtp_crypto_from_sdp)
-        {
-            Some(crypto) => crypto,
-            None => {
-                tracing::warn!(
-                    "主叫 {} 的 INVITE 缺少可用 a=crypto，无法建立 SRTP 媒体",
-                    caller_ext
-                );
-                return parser::build_response(request_text, 488, "Not Acceptable Here");
-            }
-        };
+            .and_then(extract_srtp_crypto_from_sdp);
 
-        // 生成服务端分别向主叫、被叫声明的 SRTP 密钥
-        let caller_local_crypto = SrtpCryptoSuite::new();
-        let callee_local_crypto = SrtpCryptoSuite::new();
+        let use_srtp = caller_remote_crypto.is_some();
+        if use_srtp {
+            tracing::debug!("主叫 {} 提供 a=crypto，使用 SRTP B2BUA 模式", caller_ext);
+        } else {
+            tracing::warn!("主叫 {} 未提供 a=crypto，使用普通 RTP 中继模式", caller_ext);
+        }
+
+        // 如果主叫提供 SRTP，则服务端分别向主叫、被叫声明自己的 SRTP 密钥。
+        let caller_local_crypto = use_srtp.then(SrtpCryptoSuite::new);
+        let callee_local_crypto = use_srtp.then(SrtpCryptoSuite::new);
 
         // 修改 SDP：替换媒体地址和端口，保留原始 RTP/SRTP 参数
         let callee_invite = if let Some(body) = parser::extract_body(request_text) {
-            let callee_sdes = callee_local_crypto.to_sdes_attribute();
-            let callee_key = callee_sdes.split("inline:").nth(1).unwrap_or_default();
-
-            let new_sdp = parser::rewrite_sdp(
-                &body,
-                &self.media_addr,
-                relay_session.callee_port,
-                callee_key,
-            );
+            let new_sdp = if let Some(crypto) = &callee_local_crypto {
+                let callee_sdes = crypto.to_sdes_attribute();
+                let callee_key = callee_sdes.split("inline:").nth(1).unwrap_or_default();
+                parser::rewrite_sdp(&body, &self.media_addr, relay_session.callee_port, callee_key)
+            } else {
+                parser::rewrite_sdp_plain(&body, &self.media_addr, relay_session.callee_port)
+            };
 
             // 重建 INVITE：替换 SDP body
             rebuild_request_with_sdp(request_text, &new_sdp, &self.domain)
@@ -310,7 +305,7 @@ impl Router {
                     if call.callee_tag.is_none() {
                         call.callee_tag = parser::extract_to_tag(response_text);
                     }
-                    if call.callee_remote_crypto.is_none() {
+                    if call.callee_local_crypto.is_some() && call.callee_remote_crypto.is_none() {
                         if let Some(crypto) = parser::extract_body(response_text)
                             .as_deref()
                             .and_then(extract_srtp_crypto_from_sdp)
@@ -344,16 +339,17 @@ impl Router {
             let caller_key = {
                 let calls = self.active_calls.read().unwrap();
                 if let Some(call) = calls.get(&call_id) {
-                    let sdes = call.caller_local_crypto.to_sdes_attribute();
-                    sdes.split("inline:").nth(1).unwrap_or_default().to_string()
+                    call.caller_local_crypto.as_ref().map(|crypto| {
+                        let sdes = crypto.to_sdes_attribute();
+                        sdes.split("inline:").nth(1).unwrap_or_default().to_string()
+                    })
                 } else {
-                    String::new()
+                    None
                 }
             };
 
-            if !caller_key.is_empty() {
-                let new_sdp =
-                    parser::rewrite_sdp(&body, &media_addr, caller_relay_port, &caller_key);
+            if let Some(caller_key) = caller_key {
+                let new_sdp = parser::rewrite_sdp(&body, &media_addr, caller_relay_port, &caller_key);
                 // 使用原始 INVITE 头部构建带 SDP 的响应
                 let reason = match status_code {
                     100 => "Trying",
@@ -370,7 +366,8 @@ impl Router {
                     &new_sdp,
                 )
             } else {
-                // 无密钥，不修改 SDP，但仍使用原始 INVITE 头部重建
+                // 普通 RTP 模式：只改写媒体地址和端口，不注入 crypto
+                let new_sdp = parser::rewrite_sdp_plain(&body, &media_addr, caller_relay_port);
                 let reason = match status_code {
                     100 => "Trying",
                     180 => "Ringing",
@@ -378,7 +375,13 @@ impl Router {
                     200 => "OK",
                     _ => "Unknown",
                 };
-                parser::build_response_with_body(&original_invite, status_code, reason, &[], &body)
+                parser::build_response_with_body(
+                    &original_invite,
+                    status_code,
+                    reason,
+                    &[],
+                    &new_sdp,
+                )
             }
         } else {
             // 无 SDP body — 使用原始 INVITE 头部构建简单响应
@@ -410,7 +413,9 @@ impl Router {
             let should_start = {
                 let mut calls = self.active_calls.write().unwrap();
                 if let Some(call) = calls.get_mut(&call_id) {
-                    if !call.relay_started && call.callee_remote_crypto.is_some() {
+                    let has_required_crypto =
+                        call.callee_local_crypto.is_none() || call.callee_remote_crypto.is_some();
+                    if !call.relay_started && has_required_crypto {
                         call.relay_started = true;
                         true
                     } else {
@@ -425,7 +430,7 @@ impl Router {
             } else {
                 let calls = self.active_calls.read().unwrap();
                 if let Some(call) = calls.get(&call_id) {
-                    if call.callee_remote_crypto.is_none() {
+                    if call.callee_local_crypto.is_some() && call.callee_remote_crypto.is_none() {
                         tracing::warn!("媒体中继未启动：缺少被叫 SRTP crypto (Call-ID={})", call_id);
                     }
                 }
@@ -612,13 +617,7 @@ impl Router {
             let call_id_clone = call_id.to_string();
             let caller_decrypt_crypto = call.caller_remote_crypto.clone();
             let callee_encrypt_crypto = call.callee_local_crypto.clone();
-            let callee_decrypt_crypto = match &call.callee_remote_crypto {
-                Some(crypto) => crypto.clone(),
-                None => {
-                    tracing::warn!("无法启动媒体中继：缺少被叫 SRTP crypto (Call-ID={})", call_id);
-                    return;
-                }
-            };
+            let callee_decrypt_crypto = call.callee_remote_crypto.clone();
             let caller_encrypt_crypto = call.caller_local_crypto.clone();
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
             self.media_manager.register_shutdown(call_id, shutdown_tx);

@@ -642,6 +642,16 @@ pub fn extract_uri_from_header(msg: &str, header_name: &str) -> Option<String> {
 /// 将 m=audio 行的端口替换为中继端口，并将 RTP/AVP 规范化为 RTP/SAVP。
 /// 服务器作为媒体 B2BUA，每一侧使用独立的 SDES 密钥。
 pub fn rewrite_sdp(sdp: &str, relay_addr: &str, relay_port: u16, crypto_key_b64: &str) -> String {
+    rewrite_sdp_with_crypto(sdp, relay_addr, relay_port, Some(crypto_key_b64))
+}
+
+/// 修改 SDP 中的媒体地址和端口，可选注入 SDES crypto key
+pub fn rewrite_sdp_with_crypto(
+    sdp: &str,
+    relay_addr: &str,
+    relay_port: u16,
+    crypto_key_b64: Option<&str>,
+) -> String {
     let mut result = Vec::new();
     let mut found_media = false;
     let mut crypto_inserted = false;
@@ -655,10 +665,14 @@ pub fn rewrite_sdp(sdp: &str, relay_addr: &str, relay_port: u16, crypto_key_b64:
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 4 {
                 // m=audio <port> <proto> <formats...>
-                let proto = if parts[2].contains("SAVP") {
-                    parts[2].to_string()
+                let proto = if crypto_key_b64.is_some() {
+                    if parts[2].contains("SAVP") {
+                        parts[2].to_string()
+                    } else {
+                        parts[2].replace("AVP", "SAVP")
+                    }
                 } else {
-                    parts[2].replace("AVP", "SAVP")
+                    parts[2].to_string()
                 };
                 let formats: Vec<&str> = parts[3..].to_vec();
                 result.push(format!(
@@ -674,10 +688,12 @@ pub fn rewrite_sdp(sdp: &str, relay_addr: &str, relay_port: u16, crypto_key_b64:
         } else {
             if found_media && !crypto_inserted && !line.starts_with("m=") {
                 if line.starts_with("a=crypto") {
-                    result.push(format!(
-                        "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{}",
-                        crypto_key_b64
-                    ));
+                    if let Some(key) = crypto_key_b64 {
+                        result.push(format!(
+                            "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{}",
+                            key
+                        ));
+                    }
                     crypto_inserted = true;
                     continue;
                 }
@@ -687,13 +703,19 @@ pub fn rewrite_sdp(sdp: &str, relay_addr: &str, relay_port: u16, crypto_key_b64:
     }
 
     if found_media && !crypto_inserted {
-        result.push(format!(
-            "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{}",
-            crypto_key_b64
-        ));
+        if let Some(key) = crypto_key_b64 {
+            result.push(format!(
+                "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{}",
+                key
+            ));
+        }
     }
 
     result.join("\r\n")
+}
+
+pub fn rewrite_sdp_plain(sdp: &str, relay_addr: &str, relay_port: u16) -> String {
+    rewrite_sdp_with_crypto(sdp, relay_addr, relay_port, None)
 }
 
 #[cfg(test)]
