@@ -28,7 +28,8 @@ services:
       - "${SIP_PORT:-5061}:5061/tcp"
       # RTP/SRTP 媒体端口范围（UDP）
       # 外部端口必须与容器端口一致，因为 SDP 会直接公布这些端口。
-      - "${RTP_PORT_START:-20000}-${RTP_PORT_END:-30000}:20000-30000/udp"
+      # 默认 20000-20020 支持约 10 通并发；不要在小 VPS 上一次映射上万个 UDP 端口。
+      - "${RTP_PORT_START:-20000}-${RTP_PORT_END:-20020}:${RTP_PORT_START:-20000}-${RTP_PORT_END:-20020}/udp"
 
     # 卷挂载
     volumes:

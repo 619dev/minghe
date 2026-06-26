@@ -1,7 +1,7 @@
 //! RTP/SRTP 媒体中继管理模块
 //!
 //! 管理 RTP 端口分配和媒体中继会话。
-//! 每通通话分配两对 UDP 端口，分别面向主叫和被叫，
+//! 每通通话分配两个 UDP RTP 端口，分别面向主叫和被叫，
 //! 作为 SRTP B2BUA：解密一侧的 SRTP，用另一侧的密钥重新加密后转发。
 
 use std::collections::HashMap;

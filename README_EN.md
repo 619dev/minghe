@@ -72,7 +72,7 @@ key_path = ""
 
 [media]
 rtp_port_start = 20000
-rtp_port_end = 30000
+rtp_port_end = 20020
 media_addr = "192.168.1.100"     # Required: media IP reachable by clients
 ```
 
@@ -80,12 +80,14 @@ media_addr = "192.168.1.100"     # Required: media IP reachable by clients
 
 > Each call uses two even UDP ports by default, for example `20000/UDP` and `20002/UDP` for the first call. Firewalls, cloud security groups, and container port mappings must allow both.
 
+> The default `20000-20020/udp` range supports about 10 concurrent calls and is friendly to small VPS instances. For more concurrency, expand `config.toml`, Docker port mappings, and firewall/security-group rules together. Do not map `20000-30000/udp` by default on small hosts; Docker may stall while creating thousands of UDP mappings.
+
 ### Platform Requirements
 
 | Item | Requirement |
 |:-----|:------------|
 | SIP signaling | Fixed public TCP port, default `5061/tcp` |
-| SRTP media | Fixed public UDP port range, default `20000-30000/udp` |
+| SRTP media | Fixed public UDP port range, default `20000-20020/udp` |
 | Port mapping | External ports must match the ports advertised in SDP |
 | Media address | `media_addr` must be a public or LAN IP reachable by clients |
 
@@ -198,7 +200,7 @@ docker pull facilisvelox/minghe:latest
 docker run -d \
   --name minghe-sip \
   -p 5061:5061/tcp \
-  -p 20000-30000:20000-30000/udp \
+  -p 20000-20020:20000-20020/udp \
   -v $(pwd)/config:/app/config:ro \
   -v $(pwd)/certs:/app/certs \
   facilisvelox/minghe:latest
@@ -247,7 +249,7 @@ cargo build --release
 | `RUST_LOG` | `info` | Log level: `error` / `warn` / `info` / `debug` / `trace` |
 | `SIP_PORT` | `5061` | SIP TLS port mapping |
 | `RTP_PORT_START` | `20000` | RTP port range start |
-| `RTP_PORT_END` | `30000` | RTP port range end |
+| `RTP_PORT_END` | `20020` | RTP port range end, supports about 10 concurrent calls by default |
 | `CPU_LIMIT` | `1.0` | Docker Compose CPU limit; works on 1-core VPS by default, can be increased on larger hosts |
 | `MEM_LIMIT` | `512M` | Docker Compose memory limit |
 | `TZ` | `Asia/Shanghai` | Container timezone |

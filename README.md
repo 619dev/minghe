@@ -72,7 +72,7 @@ key_path = ""
 
 [media]
 rtp_port_start = 20000
-rtp_port_end = 30000
+rtp_port_end = 20020
 media_addr = "192.168.1.100"     # 必填：客户端可访问的服务器媒体 IP
 ```
 
@@ -80,12 +80,14 @@ media_addr = "192.168.1.100"     # 必填：客户端可访问的服务器媒体
 
 > 每通电话默认占用两个偶数 UDP 端口，例如第一通为 `20000/UDP` 和 `20002/UDP`。防火墙、云安全组、容器平台端口映射必须同时放行这些端口。
 
+> 默认 `20000-20020/udp` 支持约 10 通并发，适合小 VPS。需要更多并发时，同时扩大 `config.toml`、Docker 端口映射和防火墙/安全组范围。不要在小 VPS 上默认映射 `20000-30000/udp`，Docker 创建上万个 UDP 端口映射时可能卡死。
+
 ### 部署平台要求
 
 | 项目 | 要求 |
 |:-----|:-----|
 | SIP 信令 | 固定公网 TCP 端口，默认 `5061/tcp` |
-| SRTP 媒体 | 固定公网 UDP 端口范围，默认 `20000-30000/udp` |
+| SRTP 媒体 | 固定公网 UDP 端口范围，默认 `20000-20020/udp` |
 | 端口映射 | 外部端口必须与 SDP 中公布的端口一致 |
 | 媒体地址 | `media_addr` 必须是客户端可访问的公网或内网 IP |
 
@@ -198,7 +200,7 @@ docker pull facilisvelox/minghe:latest
 docker run -d \
   --name minghe-sip \
   -p 5061:5061/tcp \
-  -p 20000-30000:20000-30000/udp \
+  -p 20000-20020:20000-20020/udp \
   -v $(pwd)/config:/app/config:ro \
   -v $(pwd)/certs:/app/certs \
   facilisvelox/minghe:latest
@@ -247,7 +249,7 @@ cargo build --release
 | `RUST_LOG` | `info` | 日志级别：`error` / `warn` / `info` / `debug` / `trace` |
 | `SIP_PORT` | `5061` | SIP TLS 端口映射 |
 | `RTP_PORT_START` | `20000` | RTP 端口范围起始 |
-| `RTP_PORT_END` | `30000` | RTP 端口范围结束 |
+| `RTP_PORT_END` | `20020` | RTP 端口范围结束，默认约 10 通并发 |
 | `CPU_LIMIT` | `1.0` | Docker Compose CPU 限制；1 核 VPS 可直接使用，多核机器可调高 |
 | `MEM_LIMIT` | `512M` | Docker Compose 内存限制 |
 | `TZ` | `Asia/Shanghai` | 容器时区 |
