@@ -46,10 +46,12 @@ pub fn extract_extension(uri_str: &str) -> Option<String> {
         uri_str
     };
 
-    // 去掉 sip: 或 sips: 前缀
+    // 去掉 sip:、sips: 或 tel: 前缀
     let without_scheme = if let Some(rest) = uri_part.strip_prefix("sip:") {
         rest
     } else if let Some(rest) = uri_part.strip_prefix("sips:") {
+        rest
+    } else if let Some(rest) = uri_part.strip_prefix("tel:") {
         rest
     } else {
         uri_part
@@ -57,7 +59,7 @@ pub fn extract_extension(uri_str: &str) -> Option<String> {
 
     // 提取 @ 之前的用户部分
     if let Some(at_pos) = without_scheme.find('@') {
-        let user = &without_scheme[..at_pos];
+        let user = without_scheme[..at_pos].split(';').next().unwrap_or("");
         if !user.is_empty() {
             Some(user.to_string())
         } else {
@@ -739,6 +741,19 @@ mod tests {
             extract_extension("sips:1002@example.com"),
             Some("1002".to_string())
         );
+    }
+
+    #[test]
+    fn test_extract_extension_with_user_param_before_host() {
+        assert_eq!(
+            extract_extension("sip:1002;user=phone@example.com"),
+            Some("1002".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_extension_tel_uri() {
+        assert_eq!(extract_extension("tel:1002"), Some("1002".to_string()));
     }
 
     #[test]
