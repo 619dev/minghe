@@ -229,8 +229,8 @@ pub async fn run_relay(
     let cr1 = caller_remote.clone();
     let cr2 = callee_remote.clone();
     let cid1 = call_id_str.clone();
-    let decrypt_caller = caller_decrypt_crypto;
-    let encrypt_callee = callee_encrypt_crypto;
+    let mut decrypt_caller = caller_decrypt_crypto;
+    let mut encrypt_callee = callee_encrypt_crypto;
 
     let mut task1 = tokio::spawn(async move {
         let mut buf = [0u8; 2048];
@@ -256,7 +256,7 @@ pub async fn run_relay(
                     };
                     if let Some(dest) = callee_addr {
                         let packet = &buf[..n];
-                        let outbound = match (&decrypt_caller, &encrypt_callee) {
+                        let outbound = match (decrypt_caller.as_mut(), encrypt_callee.as_mut()) {
                             (Some(decrypt), Some(encrypt)) => match decrypt.unprotect_rtp(packet) {
                                 Ok(rtp) => match encrypt.protect_rtp(&rtp) {
                                     Ok(srtp) => Some(srtp),
@@ -309,8 +309,8 @@ pub async fn run_relay(
     let cr3 = callee_remote.clone();
     let cr4 = caller_remote.clone();
     let cid2 = call_id_str.clone();
-    let decrypt_callee = callee_decrypt_crypto;
-    let encrypt_caller = caller_encrypt_crypto;
+    let mut decrypt_callee = callee_decrypt_crypto;
+    let mut encrypt_caller = caller_encrypt_crypto;
 
     let mut task2 = tokio::spawn(async move {
         let mut buf = [0u8; 2048];
@@ -336,7 +336,7 @@ pub async fn run_relay(
                     };
                     if let Some(dest) = caller_addr {
                         let packet = &buf[..n];
-                        let outbound = match (&decrypt_callee, &encrypt_caller) {
+                        let outbound = match (decrypt_callee.as_mut(), encrypt_caller.as_mut()) {
                             (Some(decrypt), Some(encrypt)) => match decrypt.unprotect_rtp(packet) {
                                 Ok(rtp) => match encrypt.protect_rtp(&rtp) {
                                     Ok(srtp) => Some(srtp),
