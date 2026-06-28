@@ -10,6 +10,7 @@ use base64::Engine;
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha1::Sha1;
+use std::collections::HashMap;
 use std::fmt;
 
 /// HMAC-SHA1 类型别名
@@ -97,8 +98,14 @@ pub struct SrtpCryptoSuite {
     session_salt: [u8; SESSION_SALT_LEN],
     /// 会话认证密钥（从主密钥派生）
     session_auth_key: [u8; SESSION_AUTH_KEY_LEN],
-    /// 翻转计数器（Rollover Counter）
+    /// 每个 SSRC 的 ROC 状态
+    stream_states: HashMap<u32, SrtpStreamState>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SrtpStreamState {
     roc: u32,
+    highest_sequence: Option<u16>,
 }
 
 impl SrtpCryptoSuite {
@@ -117,7 +124,7 @@ impl SrtpCryptoSuite {
             session_key: [0u8; SESSION_KEY_LEN],
             session_salt: [0u8; SESSION_SALT_LEN],
             session_auth_key: [0u8; SESSION_AUTH_KEY_LEN],
-            roc: 0,
+            stream_states: HashMap::new(),
         };
         suite.derive_session_keys();
         suite
@@ -150,7 +157,7 @@ impl SrtpCryptoSuite {
             session_key: [0u8; SESSION_KEY_LEN],
             session_salt: [0u8; SESSION_SALT_LEN],
             session_auth_key: [0u8; SESSION_AUTH_KEY_LEN],
-            roc: 0,
+            stream_states: HashMap::new(),
         };
         suite.derive_session_keys();
         Ok(suite)
@@ -290,7 +297,7 @@ impl SrtpCryptoSuite {
     ///
     /// 输入：完整的 RTP 数据包
     /// 输出：SRTP 数据包 = RTP头部 + 加密载荷 + 认证标签
-    pub fn protect_rtp(&self, packet: &[u8]) -> Result<Vec<u8>> {
+    pub fn protect_rtp(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
         if packet.len() < RTP_HEADER_MIN_LEN {
             return Err(SrtpError::InvalidRtpPacket(format!(
                 "数据包太短: {} 字节，最少需要 {} 字节",
@@ -312,7 +319,11 @@ impl SrtpCryptoSuite {
         let payload = &packet[header_len..];
 
         // 计算 packet index = ROC * 65536 + seq
-        let packet_index: u64 = (self.roc as u64) * 65536 + header.sequence_number as u64;
+        let roc = {
+            let state = self.stream_state_mut(header.ssrc);
+            estimate_roc(*state, header.sequence_number)
+        };
+        let packet_index: u64 = (roc as u64) * 65536 + header.sequence_number as u64;
 
         // AES-CM 加密载荷
         let encrypted_payload = self.aes_cm_encrypt(header.ssrc, packet_index, payload);
@@ -324,8 +335,11 @@ impl SrtpCryptoSuite {
 
         // 计算 HMAC-SHA1-80 认证标签
         // 认证范围：SRTP 头部 + 加密载荷 + ROC（4 字节，网络字节序）
-        let auth_tag = self.compute_auth_tag(&srtp_packet, self.roc);
+        let auth_tag = self.compute_auth_tag(&srtp_packet, roc);
         srtp_packet.extend_from_slice(&auth_tag);
+
+        let state = self.stream_state_mut(header.ssrc);
+        update_stream_state_after_success(state, header.sequence_number, roc);
 
         Ok(srtp_packet)
     }
@@ -338,7 +352,7 @@ impl SrtpCryptoSuite {
     ///
     /// 输入：完整的 SRTP 数据包
     /// 输出：RTP 数据包 = RTP头部 + 明文载荷
-    pub fn unprotect_rtp(&self, packet: &[u8]) -> Result<Vec<u8>> {
+    pub fn unprotect_rtp(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
         if packet.len() < RTP_HEADER_MIN_LEN + AUTH_TAG_LEN {
             return Err(SrtpError::InvalidRtpPacket(format!(
                 "SRTP 数据包太短: {} 字节",
@@ -351,12 +365,6 @@ impl SrtpCryptoSuite {
         let authenticated_portion = &packet[..auth_tag_start];
         let received_tag = &packet[auth_tag_start..];
 
-        // 验证认证标签
-        let computed_tag = self.compute_auth_tag(authenticated_portion, self.roc);
-        if !constant_time_eq(&computed_tag, received_tag) {
-            return Err(SrtpError::AuthenticationFailed);
-        }
-
         // 解析 RTP 头部
         let header = RtpHeader::parse(authenticated_portion)?;
         let header_len = header.total_header_len();
@@ -367,10 +375,21 @@ impl SrtpCryptoSuite {
             ));
         }
 
+        let roc = {
+            let state = self.stream_state_mut(header.ssrc);
+            estimate_roc(*state, header.sequence_number)
+        };
+
+        // 验证认证标签
+        let computed_tag = self.compute_auth_tag(authenticated_portion, roc);
+        if !constant_time_eq(&computed_tag, received_tag) {
+            return Err(SrtpError::AuthenticationFailed);
+        }
+
         let encrypted_payload = &authenticated_portion[header_len..];
 
         // 计算 packet index
-        let packet_index: u64 = (self.roc as u64) * 65536 + header.sequence_number as u64;
+        let packet_index: u64 = (roc as u64) * 65536 + header.sequence_number as u64;
 
         // AES-CM 解密（加解密操作相同）
         let decrypted_payload = self.aes_cm_encrypt(header.ssrc, packet_index, encrypted_payload);
@@ -379,6 +398,9 @@ impl SrtpCryptoSuite {
         let mut rtp_packet = Vec::with_capacity(header_len + decrypted_payload.len());
         rtp_packet.extend_from_slice(&authenticated_portion[..header_len]);
         rtp_packet.extend_from_slice(&decrypted_payload);
+
+        let state = self.stream_state_mut(header.ssrc);
+        update_stream_state_after_success(state, header.sequence_number, roc);
 
         Ok(rtp_packet)
     }
@@ -451,6 +473,43 @@ impl SrtpCryptoSuite {
         tag.copy_from_slice(&hmac_result[..AUTH_TAG_LEN]);
         tag
     }
+
+    fn stream_state_mut(&mut self, ssrc: u32) -> &mut SrtpStreamState {
+        self.stream_states.entry(ssrc).or_default()
+    }
+}
+
+fn estimate_roc(state: SrtpStreamState, sequence: u16) -> u32 {
+    let Some(highest_sequence) = state.highest_sequence else {
+        return state.roc;
+    };
+
+    if highest_sequence < 32768 {
+        if sequence.wrapping_sub(highest_sequence) > 32768 {
+            state.roc.saturating_sub(1)
+        } else {
+            state.roc
+        }
+    } else if highest_sequence.wrapping_sub(32768) > sequence {
+        state.roc.wrapping_add(1)
+    } else {
+        state.roc
+    }
+}
+
+fn update_stream_state_after_success(state: &mut SrtpStreamState, sequence: u16, guessed_roc: u32) {
+    let Some(highest_sequence) = state.highest_sequence else {
+        state.roc = guessed_roc;
+        state.highest_sequence = Some(sequence);
+        return;
+    };
+
+    let current_index = ((state.roc as u64) << 16) | highest_sequence as u64;
+    let guessed_index = ((guessed_roc as u64) << 16) | sequence as u64;
+    if guessed_index > current_index {
+        state.roc = guessed_roc;
+        state.highest_sequence = Some(sequence);
+    }
 }
 
 impl Default for SrtpCryptoSuite {
@@ -463,7 +522,7 @@ impl fmt::Debug for SrtpCryptoSuite {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SrtpCryptoSuite")
             .field("master_key", &"[REDACTED]")
-            .field("roc", &self.roc)
+            .field("stream_states", &self.stream_states.len())
             .finish()
     }
 }
@@ -646,6 +705,23 @@ impl RtpHeader {
 mod tests {
     use super::*;
 
+    fn make_rtp_packet(ssrc: u32, sequence: u16, payload: &[u8]) -> Vec<u8> {
+        let mut packet = Vec::new();
+        packet.push(0x80);
+        packet.push(0x00);
+        packet.extend_from_slice(&sequence.to_be_bytes());
+        packet.extend_from_slice(&(sequence as u32 * 160).to_be_bytes());
+        packet.extend_from_slice(&ssrc.to_be_bytes());
+        packet.extend_from_slice(payload);
+        packet
+    }
+
+    fn suite_with_same_key_as(suite: &SrtpCryptoSuite) -> SrtpCryptoSuite {
+        let attr = suite.to_sdes_attribute();
+        let key = attr.split("inline:").nth(1).unwrap();
+        SrtpCryptoSuite::from_sdes(key).unwrap()
+    }
+
     /// 测试创建新的加密套件
     #[test]
     fn test_new_crypto_suite() {
@@ -682,7 +758,7 @@ mod tests {
     /// 测试 RTP 加密解密往返
     #[test]
     fn test_protect_unprotect_roundtrip() {
-        let suite = SrtpCryptoSuite::new();
+        let mut suite = SrtpCryptoSuite::new();
 
         // 构造一个简单的 RTP 数据包
         // Version=2, Padding=0, Extension=0, CSRC Count=0
@@ -724,7 +800,7 @@ mod tests {
             session_key: [0u8; SESSION_KEY_LEN],
             session_salt: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
             session_auth_key: [0u8; SESSION_AUTH_KEY_LEN],
-            roc: 0,
+            stream_states: HashMap::new(),
         };
 
         let ssrc = 0x11223344u32;
@@ -766,7 +842,7 @@ mod tests {
             session_key: [0u8; SESSION_KEY_LEN],
             session_salt: [0u8; SESSION_SALT_LEN],
             session_auth_key: [0u8; SESSION_AUTH_KEY_LEN],
-            roc: 0,
+            stream_states: HashMap::new(),
         };
         suite.derive_session_keys();
 
@@ -788,7 +864,7 @@ mod tests {
             session_key: [0u8; SESSION_KEY_LEN],
             session_salt: [0u8; SESSION_SALT_LEN],
             session_auth_key: [0u8; SESSION_AUTH_KEY_LEN],
-            roc: 0,
+            stream_states: HashMap::new(),
         };
         suite.derive_session_keys();
 
@@ -806,7 +882,7 @@ mod tests {
     /// 测试认证标签篡改检测
     #[test]
     fn test_auth_tag_tamper_detection() {
-        let suite = SrtpCryptoSuite::new();
+        let mut suite = SrtpCryptoSuite::new();
 
         let mut rtp_packet = Vec::new();
         rtp_packet.push(0x80);
@@ -860,8 +936,8 @@ mod tests {
     /// 测试不同密钥无法解密
     #[test]
     fn test_different_keys_fail() {
-        let suite1 = SrtpCryptoSuite::new();
-        let suite2 = SrtpCryptoSuite::new();
+        let mut suite1 = SrtpCryptoSuite::new();
+        let mut suite2 = SrtpCryptoSuite::new();
 
         let mut rtp_packet = Vec::new();
         rtp_packet.push(0x80);
@@ -876,5 +952,38 @@ mod tests {
         // 使用不同的密钥解密应该失败（认证标签不匹配）
         let result = suite2.unprotect_rtp(&srtp_packet);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sequence_rollover_advances_roc() {
+        let mut sender = SrtpCryptoSuite::new();
+        let mut receiver = suite_with_same_key_as(&sender);
+        let ssrc = 0x214e342d;
+
+        for sequence in [65534, 65535, 0, 1, 2] {
+            let rtp = make_rtp_packet(ssrc, sequence, b"rollover");
+            let srtp = sender.protect_rtp(&rtp).unwrap();
+            let decrypted = receiver.unprotect_rtp(&srtp).unwrap();
+            assert_eq!(decrypted, rtp);
+        }
+    }
+
+    #[test]
+    fn test_new_ssrc_starts_with_independent_roc() {
+        let mut sender = SrtpCryptoSuite::new();
+        let mut receiver = suite_with_same_key_as(&sender);
+
+        for sequence in [65534, 65535, 0, 1] {
+            let rtp = make_rtp_packet(0x11111111, sequence, b"first stream");
+            let srtp = sender.protect_rtp(&rtp).unwrap();
+            assert_eq!(receiver.unprotect_rtp(&srtp).unwrap(), rtp);
+        }
+
+        let new_stream_rtp = make_rtp_packet(0x22222222, 0, b"new stream");
+        let new_stream_srtp = sender.protect_rtp(&new_stream_rtp).unwrap();
+        assert_eq!(
+            receiver.unprotect_rtp(&new_stream_srtp).unwrap(),
+            new_stream_rtp
+        );
     }
 }

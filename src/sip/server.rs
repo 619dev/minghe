@@ -246,6 +246,11 @@ async fn process_sip_message(
     writer_tx: mpsc::Sender<Vec<u8>>,
     state: &Arc<ServerState>,
 ) {
+    if msg_text.trim().is_empty() {
+        tracing::debug!("忽略 SIP keepalive 空包: {}", peer_addr);
+        return;
+    }
+
     if parser::is_request(msg_text) {
         // 处理 SIP 请求
         let method = match parser::extract_method(msg_text) {

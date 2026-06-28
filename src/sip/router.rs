@@ -590,7 +590,23 @@ impl Router {
             }
         }
 
-        tracing::info!("收到 BYE: 来自 {} (Call-ID: {})", from_extension, call_id);
+        let reason = parser::extract_header_value(request_text, "Reason")
+            .unwrap_or_else(|| "无".to_string());
+        let user_agent = parser::extract_header_value(request_text, "User-Agent")
+            .or_else(|| parser::extract_header_value(request_text, "Server"))
+            .unwrap_or_else(|| "未知".to_string());
+        let session_expires = parser::extract_header_value(request_text, "Session-Expires")
+            .or_else(|| parser::extract_header_value(request_text, "x"))
+            .unwrap_or_else(|| "无".to_string());
+
+        tracing::info!(
+            "收到 BYE: 来自 {} (Call-ID: {}, Reason: {}, User-Agent: {}, Session-Expires: {})",
+            from_extension,
+            call_id,
+            reason,
+            user_agent,
+            session_expires
+        );
 
         // 转发 BYE 到对端
         if let Some(writer) = other_writer {
@@ -855,7 +871,9 @@ fn build_outbound_request(
             continue;
         }
 
-        rewritten.push(trimmed.to_string());
+        if let Some(line) = strip_session_timer_header(trimmed) {
+            rewritten.push(line);
+        }
     }
 
     if !contact_uri.is_empty() && !saw_contact {
@@ -919,6 +937,32 @@ fn build_forwarded_invite_response(
     }
 
     response.into_bytes()
+}
+
+fn strip_session_timer_header(line: &str) -> Option<String> {
+    let Some((name, value)) = line.split_once(':') else {
+        return Some(line.to_string());
+    };
+    let name = name.trim();
+    let name_lower = name.to_ascii_lowercase();
+
+    match name_lower.as_str() {
+        "session-expires" | "x" | "min-se" => None,
+        "supported" | "k" | "require" | "proxy-require" => {
+            let option_tags: Vec<&str> = value
+                .split(',')
+                .map(str::trim)
+                .filter(|tag| !tag.is_empty() && !tag.eq_ignore_ascii_case("timer"))
+                .collect();
+
+            if option_tags.is_empty() {
+                None
+            } else {
+                Some(format!("{}: {}", name, option_tags.join(", ")))
+            }
+        }
+        _ => Some(line.to_string()),
+    }
 }
 
 fn header_lines(msg: &str, name: &str, compact: Option<&str>) -> Vec<String> {
@@ -1106,6 +1150,37 @@ mod tests {
         assert!(rewritten.contains("Contact: <sip:1001@example.com;transport=tls>\r\n"));
         assert!(!rewritten.contains("caller-device.invalid"));
         assert!(!rewritten.contains("old-proxy.invalid"));
+    }
+
+    #[test]
+    fn outbound_invite_strips_session_timer_negotiation() {
+        let invite = concat!(
+            "INVITE sip:1002@stale-contact.invalid SIP/2.0\r\n",
+            "Via: SIP/2.0/TLS caller.example.com;branch=z9hG4bKcaller\r\n",
+            "From: <sips:1001@example.com>;tag=caller-tag\r\n",
+            "To: <sips:1002@example.com>\r\n",
+            "Contact: <sips:1001@caller-device.invalid;transport=tls>\r\n",
+            "Call-ID: call-1\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Supported: outbound, timer, replaces\r\n",
+            "Require: timer\r\n",
+            "Session-Expires: 1800;refresher=uac\r\n",
+            "Min-SE: 90\r\n",
+            "Content-Length: 0\r\n\r\n"
+        );
+
+        let rewritten = build_outbound_request(
+            invite,
+            "sip:1002@callee-device.invalid;transport=tls",
+            "example.com",
+            "sip:1001@example.com;transport=tls",
+        );
+
+        assert!(rewritten.contains("Supported: outbound, replaces\r\n"));
+        assert!(!rewritten.contains("Require:"));
+        assert!(!rewritten.contains("Session-Expires:"));
+        assert!(!rewritten.contains("Min-SE:"));
+        assert!(!rewritten.to_ascii_lowercase().contains("timer"));
     }
 
     #[test]
