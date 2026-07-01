@@ -265,6 +265,10 @@ cargo build --release
 | `MEM_LIMIT` | `512M` | Docker Compose 内存限制 |
 | `TZ` | `Asia/Shanghai` | 容器时区 |
 
+如果这个项目对你有用的话，请我喝罐可乐吧。
+<br>
+<img width=30% height=30% src="请我喝可乐.jpg" alt="qrcode">
+<br>
 ## 许可证
 
 本项目采用 [Apache License 2.0](LICENSE) 开源许可协议。
