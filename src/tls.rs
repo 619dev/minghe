@@ -9,10 +9,9 @@
 //! - 构建并返回可热重载的 `ReloadableTlsAcceptor`
 //! - 自签名证书自动续期（到期前 30 天自动重新生成）
 
-use std::io::BufReader;
 use std::sync::{Arc, RwLock};
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 
@@ -65,13 +64,18 @@ pub fn setup_tls(
     config: &TlsConfig,
     host: &str,
 ) -> Result<ReloadableTlsAcceptor, Box<dyn std::error::Error>> {
-    let (certs, key) = if config.cert_path.is_empty() || config.key_path.is_empty() {
+    let (certs, key) = if config.cert_path.is_empty() && config.key_path.is_empty() {
         // 检查是否有已存在的未过期证书
         let certs_dir = std::path::Path::new("certs");
         let cert_file = certs_dir.join("server.crt");
         let key_file = certs_dir.join("server.key");
 
         if cert_file.exists() && key_file.exists() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600))?;
+            }
             // 检查现有证书是否即将过期
             if let Ok(pem_data) = std::fs::read(&cert_file) {
                 if !is_cert_expiring_soon(&pem_data) {
@@ -178,7 +182,7 @@ fn is_cert_expiring_soon(pem_data: &[u8]) -> bool {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs() as i64;
-            let days_remaining = (expiry_ts - now) / 86400;
+            let days_remaining = expiry_ts.saturating_sub(now) / 86400;
             tracing::debug!("证书剩余有效天数: {}", days_remaining);
             return days_remaining < RENEWAL_DAYS_BEFORE;
         }
@@ -228,7 +232,7 @@ fn generate_and_save_cert(
             e
         );
     }
-    if let Err(e) = std::fs::write(&key_file_path, &key_pem) {
+    if let Err(e) = write_private_key(&key_file_path, &key_pem) {
         persisted = false;
         tracing::warn!(
             "无法写入私钥文件 {}: {}。将使用内存中的临时证书继续启动；请检查 /app/certs 挂载目录权限。",
@@ -264,6 +268,29 @@ fn generate_and_save_cert(
     let key = parse_key_pem(&key_pem)?;
 
     Ok((certs, key))
+}
+
+/// Create the key with restrictive permissions before writing any secret bytes.
+fn write_private_key(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        let mut file = options.open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 /// 使用 rcgen 生成自签名证书
@@ -335,54 +362,28 @@ fn generate_self_signed(host: &str) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::e
 fn parse_cert_pem(
     pem_data: &[u8],
 ) -> Result<Vec<CertificateDer<'static>>, Box<dyn std::error::Error>> {
-    let mut reader = BufReader::new(pem_data);
-    let certs = rustls_pemfile::certs(&mut reader)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("证书 PEM 解析失败: {}", e))?;
+    let certs = CertificateDer::pem_slice_iter(pem_data).collect::<Result<Vec<_>, _>>()?;
+    if certs.is_empty() {
+        return Err("PEM 文件不包含证书".into());
+    }
     Ok(certs)
 }
 
 /// 从 PEM 字节解析私钥
 fn parse_key_pem(pem_data: &[u8]) -> Result<PrivateKeyDer<'static>, Box<dyn std::error::Error>> {
-    let mut reader = BufReader::new(pem_data);
-    let key = rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| format!("私钥 PEM 解析失败: {}", e))?
-        .ok_or("PEM 中未找到有效私钥")?;
-    Ok(key)
+    Ok(PrivateKeyDer::from_pem_slice(pem_data)?)
 }
 
 /// 从文件路径加载证书链
 fn load_certs_from_path(
     path: &str,
 ) -> Result<Vec<CertificateDer<'static>>, Box<dyn std::error::Error>> {
-    let file =
-        std::fs::File::open(path).map_err(|e| format!("无法打开证书文件 '{}': {}", path, e))?;
-    let mut reader = BufReader::new(file);
-
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("证书文件 '{}' 解析失败: {}", path, e))?;
-
-    if certs.is_empty() {
-        return Err(format!("证书文件 '{}' 中未找到有效证书", path).into());
-    }
-
-    tracing::debug!("从 '{}' 加载了 {} 张证书", path, certs.len());
-    Ok(certs)
+    parse_cert_pem(&std::fs::read(path)?)
 }
 
 /// 从文件路径加载私钥
 fn load_key_from_path(path: &str) -> Result<PrivateKeyDer<'static>, Box<dyn std::error::Error>> {
-    let file =
-        std::fs::File::open(path).map_err(|e| format!("无法打开私钥文件 '{}': {}", path, e))?;
-    let mut reader = BufReader::new(file);
-
-    let key = rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| format!("私钥文件 '{}' 解析失败: {}", path, e))?
-        .ok_or_else(|| format!("私钥文件 '{}' 中未找到有效私钥", path))?;
-
-    tracing::debug!("从 '{}' 成功加载私钥", path);
-    Ok(key)
+    parse_key_pem(&std::fs::read(path)?)
 }
 
 /// 构建 TLS Acceptor
@@ -399,4 +400,29 @@ fn build_acceptor(
             .map_err(|e| format!("TLS ServerConfig 构建失败: {}", e))?;
 
     Ok(TlsAcceptor::from(Arc::new(tls_config)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn pem_roundtrip_and_private_key_permissions() {
+        let (cert, key) = generate_self_signed("localhost").unwrap();
+        assert!(
+            build_acceptor(parse_cert_pem(&cert).unwrap(), parse_key_pem(&key).unwrap()).is_ok()
+        );
+        assert!(parse_cert_pem(b"not a certificate").is_err());
+        assert!(parse_key_pem(b"not a key").is_err());
+        let path = std::env::temp_dir().join(format!("minghe-key-{}", uuid::Uuid::new_v4()));
+        write_private_key(&path, &key).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 }

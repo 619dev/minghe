@@ -8,6 +8,7 @@ use rand::Rng;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use super::parser;
 
@@ -46,6 +47,8 @@ struct DigestParams {
 pub struct RegistrarService {
     /// 分机号码 -> 注册信息的映射
     registrations: RwLock<HashMap<String, Registration>>,
+    attempts: RwLock<HashMap<std::net::IpAddr, (Instant, u32)>>,
+    challenges: RwLock<HashMap<String, (SocketAddr, String, Instant, u32)>>,
     /// 服务器域名或 IP（用于 Digest realm）
     domain: String,
     /// 所有分机的默认密码
@@ -71,6 +74,8 @@ impl RegistrarService {
         }
         Self {
             registrations: RwLock::new(HashMap::new()),
+            attempts: RwLock::new(HashMap::new()),
+            challenges: RwLock::new(HashMap::new()),
             domain,
             default_password,
             passwords,
@@ -101,14 +106,23 @@ impl RegistrarService {
     ///      - 成功：注册/注销，返回 200 OK
     ///      - 失败：返回 403 Forbidden
     pub fn handle_register(&self, request_text: &str, from_addr: SocketAddr) -> Vec<u8> {
+        {
+            let mut attempts = self.attempts.write().unwrap();
+            attempts.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(60));
+            if !attempts.contains_key(&from_addr.ip()) && attempts.len() >= 4096 {
+                return parser::build_response(request_text, 503, "Service Unavailable");
+            }
+            let entry = attempts
+                .entry(from_addr.ip())
+                .or_insert((Instant::now(), 0));
+            if entry.1 >= 60 {
+                return parser::build_response(request_text, 429, "Too Many Requests");
+            }
+            entry.1 += 1;
+        }
         // 提取分机号
-        let extension = if let Some(uri) = parser::extract_uri_from_header(request_text, "To") {
-            parser::extract_extension(&uri)
-        } else if let Some(uri) = parser::extract_uri_from_header(request_text, "From") {
-            parser::extract_extension(&uri)
-        } else {
-            None
-        };
+        let extension = parser::extract_uri_from_header(request_text, "To")
+            .and_then(|uri| parser::extract_extension(&uri));
 
         let extension = match extension {
             Some(ext) => ext,
@@ -127,7 +141,10 @@ impl RegistrarService {
             }
         };
 
-        if ext_num < self.range_start || ext_num > self.range_end {
+        if ext_num.to_string() != extension
+            || ext_num < self.range_start
+            || ext_num > self.range_end
+        {
             tracing::warn!(
                 "分机号 {} 不在有效范围 {}-{} 内",
                 extension,
@@ -141,35 +158,55 @@ impl RegistrarService {
         let auth_header = parser::extract_header_value(request_text, "Authorization");
 
         match auth_header {
-            None => {
-                // 无认证信息，返回 401 挑战
-                let nonce = generate_nonce();
-                let www_auth = format!(
-                    "Digest realm=\"{}\", nonce=\"{}\", algorithm=MD5, qop=\"auth\"",
-                    self.domain, nonce
-                );
-                tracing::debug!("向分机 {} 发送 Digest 挑战", extension);
-                parser::build_response_with_headers(
-                    request_text,
-                    401,
-                    "Unauthorized",
-                    &[("WWW-Authenticate", &www_auth)],
-                )
-            }
+            None => self.challenge_response(request_text, from_addr, &extension, false),
             Some(auth_value) => {
                 // 解析并验证 Digest 认证
                 let params = match parse_authorization(&auth_value) {
                     Some(p) => p,
                     None => {
-                        tracing::warn!("无法解析 Authorization 头部: {}", auth_value);
+                        tracing::warn!("无法解析 Authorization 头部");
                         return parser::build_response(request_text, 400, "Bad Request");
                     }
                 };
 
-                // 获取请求 URI（用于 Digest 计算）
-                let _request_uri = parser::extract_request_uri(request_text)
-                    .unwrap_or_else(|| format!("sip:{}", self.domain));
-
+                if params.username != extension
+                    || params.realm != self.domain
+                    || parser::extract_request_uri(request_text).as_deref()
+                        != Some(params.uri.as_str())
+                    || params.qop.as_deref() != Some("auth")
+                    || params.cnonce.as_deref().is_none_or(str::is_empty)
+                {
+                    return parser::build_response(request_text, 403, "Forbidden");
+                }
+                let nc = match params
+                    .nc
+                    .as_deref()
+                    .filter(|v| v.len() == 8)
+                    .and_then(|v| u32::from_str_radix(v, 16).ok())
+                {
+                    Some(n) if n > 0 => n,
+                    _ => return parser::build_response(request_text, 403, "Forbidden"),
+                };
+                // Hold the lock through verification and counter update to reject concurrent replays.
+                let mut challenges = self.challenges.write().unwrap();
+                if challenges
+                    .get(&params.nonce)
+                    .is_none_or(|c| c.2.elapsed() >= Duration::from_secs(300))
+                {
+                    drop(challenges);
+                    return self.challenge_response(request_text, from_addr, &extension, true);
+                }
+                let challenge = match challenges.get_mut(&params.nonce) {
+                    Some(c)
+                        if c.0 == from_addr
+                            && c.1 == extension
+                            && c.2.elapsed() < Duration::from_secs(300)
+                            && nc > c.3 =>
+                    {
+                        c
+                    }
+                    _ => return parser::build_response(request_text, 403, "Forbidden"),
+                };
                 let password = self.get_password(&extension);
                 if !validate_digest(
                     &params.username,
@@ -187,11 +224,16 @@ impl RegistrarService {
                     return parser::build_response(request_text, 403, "Forbidden");
                 }
 
+                challenge.3 = nc;
+                drop(challenges);
+
                 // 认证成功
                 tracing::info!("分机 {} 认证成功（来自 {}）", extension, from_addr);
 
                 // 检查 Expires
-                let expires = parser::extract_expires(request_text).unwrap_or(3600);
+                let expires = parser::extract_expires(request_text)
+                    .unwrap_or(3600)
+                    .min(3600);
 
                 if expires == 0 {
                     // 注销
@@ -237,12 +279,51 @@ impl RegistrarService {
         }
     }
 
+    fn challenge_response(
+        &self,
+        request: &str,
+        peer: SocketAddr,
+        extension: &str,
+        stale: bool,
+    ) -> Vec<u8> {
+        let mut challenges = self.challenges.write().unwrap();
+        challenges.retain(|_, (_, _, issued, _)| issued.elapsed() < Duration::from_secs(300));
+        if challenges.len() >= 4096 {
+            return parser::build_response(request, 503, "Service Unavailable");
+        }
+        let nonce = generate_nonce();
+        challenges.insert(
+            nonce.clone(),
+            (peer, extension.to_string(), Instant::now(), 0),
+        );
+        let header = format!(
+            "Digest realm=\"{}\", nonce=\"{}\", algorithm=MD5, qop=\"auth\"{}",
+            self.domain,
+            nonce,
+            if stale { ", stale=true" } else { "" }
+        );
+        parser::build_response_with_headers(
+            request,
+            401,
+            "Unauthorized",
+            &[("WWW-Authenticate", &header)],
+        )
+    }
+
     /// 注册或更新分机
-    fn register(&self, reg: Registration) {
+    pub(super) fn register(&self, reg: Registration) {
         let ext = reg.extension.clone();
         let mut map = self.registrations.write().unwrap();
         tracing::info!("分机 {} 注册成功，联系地址: {}", ext, reg.contact);
         map.insert(ext, reg);
+    }
+
+    pub fn disconnect(&self, peer: SocketAddr) {
+        self.challenges.write().unwrap().retain(|_, c| c.0 != peer);
+        self.registrations
+            .write()
+            .unwrap()
+            .retain(|_, r| r.transport_addr != peer);
     }
 
     /// 注销分机
@@ -329,11 +410,7 @@ fn generate_nonce() -> String {
 /// 输入格式：`Digest username="1001", realm="minghe.local", nonce="xxx", uri="sip:minghe.local", response="yyy"`
 fn parse_authorization(header_value: &str) -> Option<DigestParams> {
     let value = header_value.trim();
-    let value = if let Some(rest) = value.strip_prefix("Digest") {
-        rest.trim()
-    } else {
-        value
-    };
+    let value = value.strip_prefix("Digest ")?.trim();
 
     let mut username = String::new();
     let mut realm = String::new();
@@ -344,12 +421,16 @@ fn parse_authorization(header_value: &str) -> Option<DigestParams> {
     let mut nc: Option<String> = None;
     let mut cnonce: Option<String> = None;
 
+    let mut seen = std::collections::HashSet::new();
     // 解析 key="value" 对
     // 需要处理值中可能包含逗号的情况（如 URI）
     for param in split_digest_params(value) {
         let param = param.trim();
         if let Some((key, val)) = param.split_once('=') {
-            let key = key.trim().to_lowercase();
+            let key = key.trim().to_ascii_lowercase();
+            if !seen.insert(key.clone()) {
+                return None;
+            }
             let val = val.trim().trim_matches('"').to_string();
             match key.as_str() {
                 "username" => username = val,
@@ -360,7 +441,8 @@ fn parse_authorization(header_value: &str) -> Option<DigestParams> {
                 "qop" => qop = Some(val),
                 "nc" => nc = Some(val),
                 "cnonce" => cnonce = Some(val),
-                _ => {} // 忽略其他参数 (algorithm 等)
+                "algorithm" if !val.eq_ignore_ascii_case("MD5") => return None,
+                _ => {}
             }
         }
     }
@@ -410,9 +492,7 @@ fn split_digest_params(input: &str) -> Vec<String> {
 
 /// 验证 Digest 认证响应
 ///
-/// 支持两种算法：
-/// - RFC 2069（无 qop）：response = MD5(HA1:nonce:HA2)
-/// - RFC 2617（qop=auth）：response = MD5(HA1:nonce:nc:cnonce:qop:HA2)
+/// 仅接受 qop=auth：response = MD5(HA1:nonce:nc:cnonce:qop:HA2)
 ///
 /// ```text
 /// HA1 = MD5(username:realm:password)
@@ -440,24 +520,14 @@ fn validate_digest(
             let cnonce = cnonce.unwrap_or("");
             md5_hex(&format!("{}:{}:{}:{}:auth:{}", ha1, nonce, nc, cnonce, ha2))
         }
-        _ => {
-            // RFC 2069（无 qop）：response = MD5(HA1:nonce:HA2)
-            md5_hex(&format!("{}:{}:{}", ha1, nonce, ha2))
-        }
+        _ => return false,
     };
 
-    tracing::debug!(
-        "Digest 验证: username={}, realm={}, qop={:?}, HA1={}, HA2={}, expected={}, received={}",
-        username,
-        realm,
-        qop,
-        ha1,
-        ha2,
-        expected,
-        response
-    );
-
-    expected.to_lowercase() == response.to_lowercase()
+    use subtle::ConstantTimeEq;
+    expected
+        .as_bytes()
+        .ct_eq(response.to_ascii_lowercase().as_bytes())
+        .into()
 }
 
 /// 计算 MD5 哈希并返回小写十六进制字符串
@@ -472,6 +542,83 @@ fn md5_hex(input: &str) -> String {
 mod tests {
     use super::*;
 
+    fn request(auth: &str, ext: &str) -> String {
+        format!("REGISTER sip:example.com SIP/2.0\r\nTo: <sip:{ext}@example.com>\r\nFrom: <sip:{ext}@example.com>;tag=t\r\nCall-ID: register\r\nCSeq: 1 REGISTER\r\n{auth}Content-Length: 0\r\n\r\n")
+    }
+
+    fn authorized(nonce: &str, username: &str, ext: &str, nc: &str) -> String {
+        let ha1 = md5_hex(&format!("{username}:example.com:secret"));
+        let ha2 = md5_hex("REGISTER:sip:example.com");
+        let response = md5_hex(&format!("{ha1}:{nonce}:{nc}:client:auth:{ha2}"));
+        request(&format!("Authorization: Digest username=\"{username}\", realm=\"example.com\", nonce=\"{nonce}\", uri=\"sip:example.com\", response=\"{response}\", qop=auth, nc={nc}, cnonce=\"client\"\r\n"), ext)
+    }
+
+    #[test]
+    fn register_binds_nonce_identity_transport_and_rejects_replay() {
+        let svc = RegistrarService::new(
+            "example.com".into(),
+            "secret".into(),
+            HashMap::new(),
+            1000,
+            2000,
+        );
+        let peer = "127.0.0.1:1234".parse().unwrap();
+        let response = svc.handle_register(&request("", "1001"), peer);
+        assert!(String::from_utf8(response)
+            .unwrap()
+            .contains("401 Unauthorized"));
+        let nonce = svc
+            .challenges
+            .read()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        for (req, addr) in [
+            (authorized(&nonce, "1002", "1001", "00000001"), peer),
+            (authorized(&nonce, "1001", "1002", "00000001"), peer),
+            (
+                authorized(&nonce, "1001", "1001", "00000001"),
+                "127.0.0.1:1235".parse().unwrap(),
+            ),
+        ] {
+            assert!(String::from_utf8(svc.handle_register(&req, addr))
+                .unwrap()
+                .contains("403 Forbidden"));
+        }
+        let valid = authorized(&nonce, "1001", "1001", "00000001");
+        assert!(String::from_utf8(svc.handle_register(&valid, peer))
+            .unwrap()
+            .contains("200 OK"));
+        assert!(String::from_utf8(svc.handle_register(&valid, peer))
+            .unwrap()
+            .contains("403 Forbidden"));
+        let next = authorized(&nonce, "1001", "1001", "00000002");
+        assert!(String::from_utf8(svc.handle_register(&next, peer))
+            .unwrap()
+            .contains("200 OK"));
+        svc.challenges.write().unwrap().get_mut(&nonce).unwrap().2 =
+            Instant::now() - Duration::from_secs(301);
+        let expired = String::from_utf8(
+            svc.handle_register(&authorized(&nonce, "1001", "1001", "00000003"), peer),
+        )
+        .unwrap();
+        assert!(expired.contains("401 Unauthorized") && expired.contains("stale=true"));
+    }
+
+    #[test]
+    fn digest_rejects_duplicate_parameters_and_wrong_algorithm() {
+        assert!(
+            parse_authorization("Digest username=1001, username=1002, nonce=n, response=r")
+                .is_none()
+        );
+        assert!(parse_authorization(
+            "Digest username=1001, nonce=n, response=r, algorithm=SHA-256"
+        )
+        .is_none());
+    }
+
     #[test]
     fn test_md5_hex() {
         // MD5("abc") = 900150983cd24fb0d6963f7d28e17f72
@@ -479,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn test_digest_validation_no_qop() {
+    fn test_digest_rejects_no_qop() {
         // RFC 2069（无 qop）:
         // HA1 = MD5("1001:minghe.local:minghe@2024")
         // HA2 = MD5("REGISTER:sip:minghe.local")
@@ -488,7 +635,7 @@ mod tests {
         let ha2 = md5_hex("REGISTER:sip:minghe.local");
         let response = md5_hex(&format!("{}:testnonce:{}", ha1, ha2));
 
-        assert!(validate_digest(
+        assert!(!validate_digest(
             "1001",
             "minghe.local",
             "minghe@2024",

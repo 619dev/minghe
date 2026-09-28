@@ -1,30 +1,10 @@
 //! SIP 消息解析与构建辅助函数
 //!
 //! 提供 SIP 消息的解析、序列化、URI 提取、头部生成等功能。
-//! 由于 rsip crate 的 API 在构建响应时较为复杂，
-//! 本模块采用手动构建 SIP 文本的方式，更加可靠灵活。
+//! 在严格的消息帧校验后提取头部并构建 SIP 文本。
 
-use anyhow::{anyhow, Result};
 use rand::Rng;
 use uuid::Uuid;
-
-/// 解析原始字节为 SIP 消息文本
-///
-/// 将原始 TCP 字节流中的数据转换为 UTF-8 字符串，
-/// 然后尝试解析为 rsip::SipMessage。
-pub fn parse_sip_message(data: &[u8]) -> Result<rsip::SipMessage> {
-    let text = std::str::from_utf8(data).map_err(|e| anyhow!("SIP 消息 UTF-8 解码失败: {}", e))?;
-    let msg: rsip::SipMessage = text
-        .to_string()
-        .try_into()
-        .map_err(|e: rsip::Error| anyhow!("SIP 消息解析失败: {}", e))?;
-    Ok(msg)
-}
-
-/// 将 SIP 消息序列化为字节
-pub fn serialize_message(msg: &rsip::SipMessage) -> Vec<u8> {
-    msg.to_string().into_bytes()
-}
 
 /// 从 SIP URI 中提取用户部分（分机号）
 ///
@@ -36,7 +16,7 @@ pub fn serialize_message(msg: &rsip::SipMessage) -> Vec<u8> {
 pub fn extract_extension(uri_str: &str) -> Option<String> {
     // 尝试从尖括号中提取 URI
     let uri_part = if let Some(start) = uri_str.find('<') {
-        if let Some(end) = uri_str.find('>') {
+        if let Some(end) = uri_str[start + 1..].find('>').map(|i| start + 1 + i) {
             &uri_str[start + 1..end]
         } else {
             uri_str
@@ -46,7 +26,7 @@ pub fn extract_extension(uri_str: &str) -> Option<String> {
     };
 
     // 去掉 sip:、sips: 或 tel: 前缀。URI scheme 大小写不敏感。
-    let lower_uri = uri_part.to_lowercase();
+    let lower_uri = uri_part.to_ascii_lowercase();
     let without_scheme = if lower_uri.starts_with("sip:") {
         &uri_part[4..]
     } else if lower_uri.starts_with("sips:") {
@@ -111,7 +91,7 @@ pub fn build_response(request: &str, status_code: u16, reason: &str) -> Vec<u8> 
         if line_trimmed.is_empty() {
             break; // 头部结束
         }
-        let lower = line_trimmed.to_lowercase();
+        let lower = line_trimmed.to_ascii_lowercase();
         if lower.starts_with("via:") || lower.starts_with("v:") {
             via_headers.push(line_trimmed.to_string());
         } else if lower.starts_with("from:") || lower.starts_with("f:") {
@@ -126,7 +106,7 @@ pub fn build_response(request: &str, status_code: u16, reason: &str) -> Vec<u8> 
     }
 
     // 如果 To 头部没有 tag 参数，添加一个（用于非 100 响应）
-    if status_code > 100 && !to_header.to_lowercase().contains("tag=") {
+    if status_code > 100 && !to_header.to_ascii_lowercase().contains("tag=") {
         to_header = format!("{};tag={}", to_header, generate_tag());
     }
 
@@ -167,7 +147,7 @@ pub fn build_response_with_headers(
         if line_trimmed.is_empty() {
             break;
         }
-        let lower = line_trimmed.to_lowercase();
+        let lower = line_trimmed.to_ascii_lowercase();
         if lower.starts_with("via:") || lower.starts_with("v:") {
             via_headers.push(line_trimmed.to_string());
         } else if lower.starts_with("from:") || lower.starts_with("f:") {
@@ -181,7 +161,7 @@ pub fn build_response_with_headers(
         }
     }
 
-    if status_code > 100 && !to_header.to_lowercase().contains("tag=") {
+    if status_code > 100 && !to_header.to_ascii_lowercase().contains("tag=") {
         to_header = format!("{};tag={}", to_header, generate_tag());
     }
 
@@ -228,7 +208,7 @@ pub fn build_response_with_body(
         if line_trimmed.is_empty() {
             break;
         }
-        let lower = line_trimmed.to_lowercase();
+        let lower = line_trimmed.to_ascii_lowercase();
         if lower.starts_with("via:") || lower.starts_with("v:") {
             via_headers.push(line_trimmed.to_string());
         } else if lower.starts_with("from:") || lower.starts_with("f:") {
@@ -242,7 +222,7 @@ pub fn build_response_with_body(
         }
     }
 
-    if status_code > 100 && !to_header.to_lowercase().contains("tag=") {
+    if status_code > 100 && !to_header.to_ascii_lowercase().contains("tag=") {
         to_header = format!("{};tag={}", to_header, generate_tag());
     }
 
@@ -284,7 +264,7 @@ pub fn build_response_with_body(
 pub fn extract_contact_uri(request: &str) -> Option<String> {
     for line in request.lines() {
         let trimmed = line.trim();
-        let lower = trimmed.to_lowercase();
+        let lower = trimmed.to_ascii_lowercase();
         if lower.starts_with("contact:") || lower.starts_with("m:") {
             let value = if lower.starts_with("contact:") {
                 trimmed[8..].trim()
@@ -293,7 +273,7 @@ pub fn extract_contact_uri(request: &str) -> Option<String> {
             };
             // 提取尖括号中的 URI
             if let Some(start) = value.find('<') {
-                if let Some(end) = value.find('>') {
+                if let Some(end) = value[start + 1..].find('>').map(|i| start + 1 + i) {
                     return Some(value[start + 1..end].to_string());
                 }
             }
@@ -315,9 +295,9 @@ pub fn extract_contact_uri(request: &str) -> Option<String> {
 
 /// 从 SIP 消息中提取 Call-ID
 pub fn extract_call_id(msg: &str) -> Option<String> {
-    for line in msg.lines() {
+    for line in msg.lines().take_while(|line| !line.trim().is_empty()) {
         let trimmed = line.trim();
-        let lower = trimmed.to_lowercase();
+        let lower = trimmed.to_ascii_lowercase();
         if lower.starts_with("call-id:") {
             return Some(trimmed[8..].trim().to_string());
         } else if lower.starts_with("i:") {
@@ -331,11 +311,11 @@ pub fn extract_call_id(msg: &str) -> Option<String> {
 ///
 /// 根据头部名称从 SIP 请求文本中提取对应的值
 pub fn extract_header_value(msg: &str, name: &str) -> Option<String> {
-    let name_lower = name.to_lowercase();
+    let name_lower = name.to_ascii_lowercase();
     let search_prefix = format!("{}:", name_lower);
-    for line in msg.lines() {
+    for line in msg.lines().take_while(|line| !line.trim().is_empty()) {
         let trimmed = line.trim();
-        if trimmed.to_lowercase().starts_with(&search_prefix) {
+        if trimmed.to_ascii_lowercase().starts_with(&search_prefix) {
             let value = trimmed[name.len() + 1..].trim();
             return Some(value.to_string());
         }
@@ -401,9 +381,9 @@ pub fn extract_status_code(msg: &str) -> Option<u16> {
 
 /// 提取 Via 分支参数
 pub fn extract_via_branch(msg: &str) -> Option<String> {
-    for line in msg.lines() {
+    for line in msg.lines().take_while(|line| !line.trim().is_empty()) {
         let trimmed = line.trim();
-        let lower = trimmed.to_lowercase();
+        let lower = trimmed.to_ascii_lowercase();
         if lower.starts_with("via:") || lower.starts_with("v:") {
             // 在 Via 头部中查找 branch= 参数
             if let Some(branch_pos) = lower.find("branch=") {
@@ -423,9 +403,9 @@ pub fn extract_via_branch(msg: &str) -> Option<String> {
 
 /// 提取 From 头部中的 tag 参数
 pub fn extract_from_tag(msg: &str) -> Option<String> {
-    for line in msg.lines() {
+    for line in msg.lines().take_while(|line| !line.trim().is_empty()) {
         let trimmed = line.trim();
-        let lower = trimmed.to_lowercase();
+        let lower = trimmed.to_ascii_lowercase();
         if lower.starts_with("from:") || lower.starts_with("f:") {
             if let Some(tag_pos) = lower.find("tag=") {
                 let after_tag = &trimmed[tag_pos + 4..];
@@ -444,9 +424,9 @@ pub fn extract_from_tag(msg: &str) -> Option<String> {
 
 /// 提取 To 头部中的 tag 参数
 pub fn extract_to_tag(msg: &str) -> Option<String> {
-    for line in msg.lines() {
+    for line in msg.lines().take_while(|line| !line.trim().is_empty()) {
         let trimmed = line.trim();
-        let lower = trimmed.to_lowercase();
+        let lower = trimmed.to_ascii_lowercase();
         if lower.starts_with("to:") || lower.starts_with("t:") {
             if let Some(tag_pos) = lower.find("tag=") {
                 let after_tag = &trimmed[tag_pos + 4..];
@@ -465,9 +445,9 @@ pub fn extract_to_tag(msg: &str) -> Option<String> {
 
 /// 提取 CSeq 头部中的方法名
 pub fn extract_cseq_method(msg: &str) -> Option<String> {
-    for line in msg.lines() {
+    for line in msg.lines().take_while(|line| !line.trim().is_empty()) {
         let trimmed = line.trim();
-        let lower = trimmed.to_lowercase();
+        let lower = trimmed.to_ascii_lowercase();
         if lower.starts_with("cseq:") {
             let value = trimmed[5..].trim();
             // CSeq 格式: <序号> <方法>
@@ -483,9 +463,9 @@ pub fn extract_cseq_method(msg: &str) -> Option<String> {
 /// 提取 Expires 头部值
 pub fn extract_expires(msg: &str) -> Option<u64> {
     // 先检查 Expires 头部
-    for line in msg.lines() {
+    for line in msg.lines().take_while(|line| !line.trim().is_empty()) {
         let trimmed = line.trim();
-        let lower = trimmed.to_lowercase();
+        let lower = trimmed.to_ascii_lowercase();
         if lower.starts_with("expires:") {
             let value = trimmed[8..].trim();
             return value.parse().ok();
@@ -493,9 +473,9 @@ pub fn extract_expires(msg: &str) -> Option<u64> {
     }
 
     // 再检查 Contact 头部中的 expires 参数
-    for line in msg.lines() {
+    for line in msg.lines().take_while(|line| !line.trim().is_empty()) {
         let trimmed = line.trim();
-        let lower = trimmed.to_lowercase();
+        let lower = trimmed.to_ascii_lowercase();
         if lower.starts_with("contact:") || lower.starts_with("m:") {
             if let Some(pos) = lower.find("expires=") {
                 let after = &trimmed[pos + 8..];
@@ -553,19 +533,61 @@ pub fn frame_sip_message(buf: &[u8]) -> SipFrameResult {
     }
 
     let Some(header_end) = header_end_pos else {
-        return SipFrameResult::Incomplete;
+        return if buf.len() > 16384 {
+            SipFrameResult::Invalid
+        } else {
+            SipFrameResult::Incomplete
+        };
     };
     let headers_with_separator = header_end + 4; // 包括 \r\n\r\n
 
+    if header_end > 16384 {
+        return SipFrameResult::Invalid;
+    }
     // 解析 Content-Length 头部
     let Ok(header_text) = std::str::from_utf8(&buf[..header_end]) else {
         return SipFrameResult::Invalid;
     };
+    let mut seen = std::collections::HashSet::new();
+    for line in header_text.split("\r\n").skip(1) {
+        if line.starts_with([' ', '\t']) || line.bytes().any(|b| b < 32 && b != b'\t' || b == 127) {
+            return SipFrameResult::Invalid;
+        }
+        let Some((name, _)) = line.split_once(':') else {
+            return SipFrameResult::Invalid;
+        };
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return SipFrameResult::Invalid;
+        }
+        let name = name.to_ascii_lowercase();
+        let canonical = match name.as_str() {
+            "f" => "from",
+            "t" => "to",
+            "i" => "call-id",
+            "m" => "contact",
+            "l" => "content-length",
+            other => other,
+        };
+        if matches!(
+            canonical,
+            "from"
+                | "to"
+                | "call-id"
+                | "contact"
+                | "cseq"
+                | "authorization"
+                | "content-length"
+                | "expires"
+        ) && !seen.insert(canonical.to_string())
+        {
+            return SipFrameResult::Invalid;
+        }
+    }
     let mut content_length: Option<usize> = None;
 
     for line in header_text.lines() {
         let trimmed = line.trim();
-        let lower = trimmed.to_lowercase();
+        let lower = trimmed.to_ascii_lowercase();
         if lower.starts_with("content-length:") || lower.starts_with("l:") {
             let value = if lower.starts_with("content-length:") {
                 trimmed[15..].trim()
@@ -586,6 +608,9 @@ pub fn frame_sip_message(buf: &[u8]) -> SipFrameResult {
         return SipFrameResult::Invalid;
     };
 
+    if total_length > 65536 {
+        return SipFrameResult::Invalid;
+    }
     // 检查缓冲区中是否有足够的数据
     if buf.len() >= total_length {
         SipFrameResult::Complete(total_length)
@@ -619,9 +644,9 @@ pub fn is_response(msg: &str) -> bool {
 /// - To / t:
 /// - Contact / m:
 pub fn extract_uri_from_header(msg: &str, header_name: &str) -> Option<String> {
-    let search = format!("{}:", header_name.to_lowercase());
+    let search = format!("{}:", header_name.to_ascii_lowercase());
     // SIP 紧凑格式映射
-    let compact = match header_name.to_lowercase().as_str() {
+    let compact = match header_name.to_ascii_lowercase().as_str() {
         "from" => Some("f:"),
         "to" => Some("t:"),
         "contact" => Some("m:"),
@@ -630,9 +655,9 @@ pub fn extract_uri_from_header(msg: &str, header_name: &str) -> Option<String> {
         _ => None,
     };
 
-    for line in msg.lines() {
+    for line in msg.lines().take_while(|line| !line.trim().is_empty()) {
         let trimmed = line.trim();
-        let lower = trimmed.to_lowercase();
+        let lower = trimmed.to_ascii_lowercase();
 
         let value_opt = if lower.starts_with(&search) {
             Some(&trimmed[header_name.len() + 1..])
@@ -649,7 +674,7 @@ pub fn extract_uri_from_header(msg: &str, header_name: &str) -> Option<String> {
         if let Some(value) = value_opt {
             // 尝试从尖括号中提取
             if let Some(start) = value.find('<') {
-                if let Some(end) = value.find('>') {
+                if let Some(end) = value[start + 1..].find('>').map(|i| start + 1 + i) {
                     return Some(value[start + 1..end].to_string());
                 }
             }
@@ -822,6 +847,42 @@ fn should_strip_for_sdes_srtp(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_ambiguous_and_oversized_frames() {
+        for headers in [
+            "From: a\r\nf: b",
+            "Content-Length: 0\r\nl: 0",
+            " Content-Length: 0",
+            "Content-Length : 0",
+            "X: bad\nFrom: injected",
+            "Content-Length: 999999999",
+        ] {
+            let message = format!("OPTIONS sip:example.com SIP/2.0\r\n{headers}\r\n\r\n");
+            assert_eq!(
+                frame_sip_message(message.as_bytes()),
+                SipFrameResult::Invalid,
+                "{headers}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_brackets_and_unicode_never_panic_or_read_body_headers() {
+        for value in [
+            ">sip:1001@example.com<",
+            "İİ<sip:1001@example.com>",
+            "><",
+            "😀<>",
+        ] {
+            let msg = format!("REGISTER sip:example.com SIP/2.0\r\nContact: {value}\r\nFrom: {value};tag=test\r\n\r\nAuthorization: stolen");
+            let _ = extract_extension(value);
+            let _ = extract_uri_from_header(&msg, "From");
+            let _ = extract_contact_uri(&msg);
+            let _ = extract_from_tag(&msg);
+            assert!(extract_header_value(&msg, "Authorization").is_none());
+        }
+    }
 
     #[test]
     fn test_extract_extension_basic() {

@@ -8,9 +8,9 @@
 //! - `message`: 即时消息服务（MESSAGE 在线转发与离线补投）
 //! - `transaction`: 事务管理
 
+pub mod message;
 pub mod parser;
 pub mod registrar;
 pub mod router;
-pub mod message;
 pub mod server;
 pub mod transaction;

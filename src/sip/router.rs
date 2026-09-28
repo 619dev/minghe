@@ -8,11 +8,11 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 
+use super::message::MessageService;
 use super::parser;
 use super::registrar::RegistrarService;
 use crate::media::relay::MediaRelayManager;
 use crate::media::srtp::{parse_crypto_attribute, SrtpCryptoSuite, SrtpSuite};
-use super::message::MessageService;
 
 /// 呼叫状态
 #[derive(Debug, Clone, PartialEq)]
@@ -32,6 +32,7 @@ pub enum CallState {
 pub struct CallInfo {
     /// Call-ID
     pub call_id: String,
+    created_at: std::time::Instant,
     /// 主叫分机号
     pub caller_ext: String,
     /// 被叫分机号
@@ -126,6 +127,78 @@ impl Router {
         }
     }
 
+    /// Bind dialog actions to the exact TLS channel that established the call.
+    pub fn authorizes_dialog(
+        &self,
+        text: &str,
+        writer: &mpsc::Sender<Vec<u8>>,
+        method: &str,
+    ) -> bool {
+        let Some(id) = parser::extract_call_id(text) else {
+            return false;
+        };
+        let calls = self.active_calls.read().unwrap();
+        let Some(call) = calls.get(&id) else {
+            return false;
+        };
+        let caller = call.caller_writer.same_channel(writer);
+        let callee = call
+            .callee_writer
+            .as_ref()
+            .is_some_and(|w| w.same_channel(writer));
+        match method {
+            "RESPONSE" => {
+                callee
+                    && parser::extract_header_value(text, "CSeq")
+                        == parser::extract_header_value(&call.original_invite, "CSeq")
+            }
+            "ACK" => caller,
+            "CANCEL" => caller && call.state != CallState::Established,
+            "BYE" => caller || callee,
+            _ => false,
+        }
+    }
+
+    pub fn cleanup_disconnected(&self, writer: &mpsc::Sender<Vec<u8>>) {
+        let ids: Vec<_> = self
+            .active_calls
+            .read()
+            .unwrap()
+            .values()
+            .filter(|c| {
+                c.caller_writer.same_channel(writer)
+                    || c.callee_writer
+                        .as_ref()
+                        .is_some_and(|w| w.same_channel(writer))
+            })
+            .map(|c| c.call_id.clone())
+            .collect();
+        for id in ids {
+            self.cleanup_call(&id);
+        }
+    }
+
+    pub fn cleanup_expired_calls(&self) {
+        let ids: Vec<_> = self
+            .active_calls
+            .read()
+            .unwrap()
+            .values()
+            .filter(|c| {
+                c.created_at.elapsed().as_secs()
+                    > if c.state == CallState::Established {
+                        14400
+                    } else {
+                        120
+                    }
+            })
+            .map(|c| c.call_id.clone())
+            .collect();
+        for id in ids {
+            self.cleanup_call(&id);
+        }
+    }
+
     /// 注册分机的写入通道（由 server 模块在注册成功后调用）
     pub fn register_writer(&self, extension: &str, writer: mpsc::Sender<Vec<u8>>) {
         let mut writers = self.connection_writers.write().unwrap();
@@ -148,12 +221,16 @@ impl Router {
 
     /// 处理 MESSAGE 请求（委托给 MessageService，实现在 message 模块）
     pub async fn handle_message(&self, request_text: &str, from_ext: &str) -> Vec<u8> {
-        self.message_service.handle_message(request_text, from_ext).await
+        self.message_service
+            .handle_message(request_text, from_ext)
+            .await
     }
 
     /// 补投分机的离线即时消息（委托给 MessageService，实现在 message 模块）
     pub async fn deliver_offline_messages(&self, extension: &str) {
-        self.message_service.deliver_offline_messages(extension).await
+        self.message_service
+            .deliver_offline_messages(extension)
+            .await
     }
 
     /// 处理 INVITE 请求
@@ -189,16 +266,26 @@ impl Router {
             call_id
         );
 
-        // 如果同一 Call-ID 已有活跃呼叫（上次呼叫残留），先清理
-        {
-            let calls = self.active_calls.read().unwrap();
-            if calls.contains_key(&call_id) {
-                tracing::warn!("发现残留呼叫，清理: Call-ID={}", call_id);
-                drop(calls); // 释放读锁
-                self.cleanup_call(&call_id);
-            }
+        if call_id.is_empty() || caller_tag.is_empty() {
+            return parser::build_response(request_text, 400, "Bad Request");
+        }
+        // Never replace a live call using an attacker-controlled Call-ID.
+        if self.active_calls.read().unwrap().contains_key(&call_id) {
+            return parser::build_response(request_text, 482, "Loop Detected");
         }
 
+        {
+            let calls = self.active_calls.read().unwrap();
+            if calls.len() >= 256
+                || calls
+                    .values()
+                    .filter(|c| c.caller_ext == caller_ext)
+                    .count()
+                    >= 2
+            {
+                return parser::build_response(request_text, 503, "Service Unavailable");
+            }
+        }
         // 检查被叫是否在线
         if !self.registrar.is_registered(&callee_ext) {
             tracing::warn!(
@@ -266,8 +353,7 @@ impl Router {
         // 被叫侧同时提供 AES_CM_128 与 AEAD_AES_128_GCM 两种套件，供被叫选择。
         let caller_local_crypto = SrtpCryptoSuite::new_with_suite(caller_remote_crypto.suite());
         let callee_local_crypto = SrtpCryptoSuite::new(); // AES_CM_128 (tag 1)
-        let callee_local_crypto_gcm =
-            SrtpCryptoSuite::new_with_suite(SrtpSuite::AeadAes128Gcm); // AEAD_AES_128_GCM (tag 2)
+        let callee_local_crypto_gcm = SrtpCryptoSuite::new_with_suite(SrtpSuite::AeadAes128Gcm); // AEAD_AES_128_GCM (tag 2)
 
         // 修改 SDP：替换媒体地址和端口，并强制声明 RTP/SAVP + SDES crypto
         let callee_cryptos = vec![
@@ -307,6 +393,7 @@ impl Router {
         // 存储呼叫信息
         let call_info = CallInfo {
             call_id: call_id.clone(),
+            created_at: std::time::Instant::now(),
             caller_ext: caller_ext.clone(),
             callee_ext: callee_ext.clone(),
             caller_tag,
@@ -332,6 +419,9 @@ impl Router {
 
         {
             let mut calls = self.active_calls.write().unwrap();
+            if calls.contains_key(&call_id) {
+                return parser::build_response(request_text, 482, "Loop Detected");
+            }
             calls.insert(call_id.clone(), call_info);
         }
 
@@ -656,6 +746,9 @@ impl Router {
                 }
             };
 
+            if from_extension != call.caller_ext && from_extension != call.callee_ext {
+                return parser::build_response(request_text, 403, "Forbidden");
+            }
             // 确定对端的写入通道
             if from_extension == call.caller_ext {
                 other_writer = call.callee_writer.clone();
@@ -807,7 +900,8 @@ impl Router {
             let call_id_clone = call_id.to_string();
             let caller_decrypt_crypto = call.caller_remote_crypto.clone();
             // 根据被叫 answer 中选定的套件，选择对应的本地加密套件（被叫选 GCM 时使用 GCM 实例）
-            let callee_encrypt_crypto = match call.callee_remote_crypto.as_ref().map(|c| c.suite()) {
+            let callee_encrypt_crypto = match call.callee_remote_crypto.as_ref().map(|c| c.suite())
+            {
                 Some(SrtpSuite::AeadAes128Gcm) => call
                     .callee_local_crypto_gcm
                     .clone()
@@ -821,6 +915,7 @@ impl Router {
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
             self.media_manager.register_shutdown(call_id, shutdown_tx);
 
+            let media_manager = Arc::clone(&self.media_manager);
             tokio::spawn(async move {
                 if let Err(e) = crate::media::relay::run_relay(
                     &call_id_clone,
@@ -839,6 +934,7 @@ impl Router {
                 {
                     tracing::error!("媒体中继错误 ({}): {}", call_id_clone, e);
                 }
+                media_manager.finish_session(&call_id_clone);
             });
         }
     }
@@ -863,7 +959,7 @@ fn rebuild_request_with_sdp(request: &str, new_sdp: &str, _domain: &str) -> Vec<
     // 更新 Content-Length 并重建消息
     let mut new_headers = Vec::new();
     for line in headers.lines() {
-        let lower = line.to_lowercase();
+        let lower = line.to_ascii_lowercase();
         if lower.starts_with("content-length:") || lower.starts_with("l:") {
             new_headers.push(format!("Content-Length: {}", sdp_bytes.len()));
         } else if lower.starts_with("content-type:") {
@@ -877,7 +973,7 @@ fn rebuild_request_with_sdp(request: &str, new_sdp: &str, _domain: &str) -> Vec<
     // 确保有 Content-Type
     let has_content_type = new_headers
         .iter()
-        .any(|h| h.to_lowercase().starts_with("content-type:"));
+        .any(|h| h.to_ascii_lowercase().starts_with("content-type:"));
     if !has_content_type {
         new_headers.push("Content-Type: application/sdp".to_string());
     }
@@ -885,7 +981,7 @@ fn rebuild_request_with_sdp(request: &str, new_sdp: &str, _domain: &str) -> Vec<
     // 确保有 Content-Length
     let has_content_length = new_headers
         .iter()
-        .any(|h| h.to_lowercase().starts_with("content-length:"));
+        .any(|h| h.to_ascii_lowercase().starts_with("content-length:"));
     if !has_content_length {
         new_headers.push(format!("Content-Length: {}", sdp_bytes.len()));
     }
@@ -955,8 +1051,11 @@ pub(crate) fn build_outbound_request_with_from(
             break;
         }
 
-        let lower = trimmed.to_lowercase();
+        let lower = trimmed.to_ascii_lowercase();
         if lower.starts_with("via:") || lower.starts_with("v:") {
+            continue;
+        }
+        if lower.starts_with("authorization:") || lower.starts_with("proxy-authorization:") {
             continue;
         }
         if lower.starts_with("route:") {
@@ -975,13 +1074,10 @@ pub(crate) fn build_outbound_request_with_from(
         if lower.starts_with("from:") || lower.starts_with("f:") {
             if !authenticated_from.is_empty() {
                 // 重写为认证主叫，保留原 From 头的 tag 参数
-                let tag = trimmed
-                    .split(';')
-                    .skip(1)
-                    .find_map(|p| {
-                        let p = p.trim();
-                        p.starts_with("tag=").then(|| p.to_string())
-                    });
+                let tag = trimmed.split(';').skip(1).find_map(|p| {
+                    let p = p.trim();
+                    p.starts_with("tag=").then(|| p.to_string())
+                });
                 match tag {
                     Some(t) => rewritten.push(format!("From: <{}>;{}", authenticated_from, t)),
                     None => rewritten.push(format!("From: <{}>", authenticated_from)),
@@ -1091,14 +1187,14 @@ fn strip_unsupported_negotiation_header(line: &str) -> Option<String> {
 }
 
 fn header_lines(msg: &str, name: &str, compact: Option<&str>) -> Vec<String> {
-    let name_prefix = format!("{}:", name.to_lowercase());
-    let compact_prefix = compact.map(|c| format!("{}:", c.to_lowercase()));
+    let name_prefix = format!("{}:", name.to_ascii_lowercase());
+    let compact_prefix = compact.map(|c| format!("{}:", c.to_ascii_lowercase()));
 
     msg.lines()
         .map(str::trim)
         .take_while(|line| !line.is_empty())
         .filter(|line| {
-            let lower = line.to_lowercase();
+            let lower = line.to_ascii_lowercase();
             lower.starts_with(&name_prefix)
                 || compact_prefix
                     .as_ref()
@@ -1127,7 +1223,11 @@ pub(crate) fn server_contact_uri(extension: &str, domain: &str) -> String {
     format!("sip:{}@{};transport=tls", extension, domain)
 }
 
-pub(crate) fn registered_contact_uri(extension: &str, domain: &str, registrar: &RegistrarService) -> String {
+pub(crate) fn registered_contact_uri(
+    extension: &str,
+    domain: &str,
+    registrar: &RegistrarService,
+) -> String {
     registrar
         .lookup(extension)
         .map(|reg| reg.contact)
@@ -1191,7 +1291,7 @@ fn extract_srtp_crypto_from_sdp(sdp: &str) -> Option<(u32, SrtpCryptoSuite)> {
                                 }
                             }
                             Err(e) => {
-                                tracing::warn!("无法解析 SDP crypto 密钥 '{}': {}", trimmed, e);
+                                tracing::warn!("无法解析 SDP crypto 密钥: {}", e);
                             }
                         }
                     }
@@ -1203,7 +1303,8 @@ fn extract_srtp_crypto_from_sdp(sdp: &str) -> Option<(u32, SrtpCryptoSuite)> {
                     }
                 },
                 Err(e) => {
-                    tracing::warn!("无法解析 SDP crypto 行 '{}': {}", trimmed, e);
+                    tracing::warn!("无法解析 SDP crypto 行");
+                    let _ = e;
                 }
             }
         }
@@ -1264,10 +1365,7 @@ mod tests {
             1,
             SrtpSuite::AesCm128HmacSha180
         ));
-        assert!(callee_answer_crypto_is_offered(
-            2,
-            SrtpSuite::AeadAes128Gcm
-        ));
+        assert!(callee_answer_crypto_is_offered(2, SrtpSuite::AeadAes128Gcm));
         assert!(!callee_answer_crypto_is_offered(
             2,
             SrtpSuite::AesCm128HmacSha180

@@ -168,6 +168,7 @@ pub struct SrtpCryptoSuite {
 struct SrtpStreamState {
     roc: u32,
     highest_sequence: Option<u16>,
+    replay_window: u64,
 }
 
 impl SrtpCryptoSuite {
@@ -421,10 +422,25 @@ impl SrtpCryptoSuite {
         let payload = &packet[header_len..];
 
         // 计算 packet index = ROC * 65536 + seq
-        let roc = {
-            let state = self.stream_state_mut(header.ssrc);
-            estimate_roc(*state, header.sequence_number)
-        };
+        let snapshot = self
+            .stream_states
+            .get(&header.ssrc)
+            .copied()
+            .unwrap_or_default();
+        if !self.stream_states.contains_key(&header.ssrc) && self.stream_states.len() >= 64 {
+            return Err(SrtpError::AuthenticationFailed);
+        }
+        let roc = estimate_roc(snapshot, header.sequence_number);
+        let index = ((roc as u64) << 16) | header.sequence_number as u64;
+        if let Some(seq) = snapshot.highest_sequence {
+            let highest = ((snapshot.roc as u64) << 16) | seq as u64;
+            if index <= highest {
+                let delta = highest - index;
+                if delta >= 64 || snapshot.replay_window & (1u64 << delta) != 0 {
+                    return Err(SrtpError::AuthenticationFailed);
+                }
+            }
+        }
         let packet_index: u64 = (roc as u64) * 65536 + header.sequence_number as u64;
 
         let srtp_packet = match self.suite {
@@ -497,10 +513,25 @@ impl SrtpCryptoSuite {
             ));
         }
 
-        let roc = {
-            let state = self.stream_state_mut(header.ssrc);
-            estimate_roc(*state, header.sequence_number)
-        };
+        let snapshot = self
+            .stream_states
+            .get(&header.ssrc)
+            .copied()
+            .unwrap_or_default();
+        if !self.stream_states.contains_key(&header.ssrc) && self.stream_states.len() >= 64 {
+            return Err(SrtpError::AuthenticationFailed);
+        }
+        let roc = estimate_roc(snapshot, header.sequence_number);
+        let index = ((roc as u64) << 16) | header.sequence_number as u64;
+        if let Some(seq) = snapshot.highest_sequence {
+            let highest = ((snapshot.roc as u64) << 16) | seq as u64;
+            if index <= highest {
+                let delta = highest - index;
+                if delta >= 64 || snapshot.replay_window & (1u64 << delta) != 0 {
+                    return Err(SrtpError::AuthenticationFailed);
+                }
+            }
+        }
 
         let rtp_packet = match self.suite {
             SrtpSuite::AesCm128HmacSha180 => {
@@ -692,7 +723,7 @@ fn estimate_roc(state: SrtpStreamState, sequence: u16) -> u32 {
     };
 
     if highest_sequence < 32768 {
-        if sequence.wrapping_sub(highest_sequence) > 32768 {
+        if u32::from(sequence) > u32::from(highest_sequence) + 32768 {
             state.roc.saturating_sub(1)
         } else {
             state.roc
@@ -708,14 +739,23 @@ fn update_stream_state_after_success(state: &mut SrtpStreamState, sequence: u16,
     let Some(highest_sequence) = state.highest_sequence else {
         state.roc = guessed_roc;
         state.highest_sequence = Some(sequence);
+        state.replay_window = 1;
         return;
     };
 
     let current_index = ((state.roc as u64) << 16) | highest_sequence as u64;
     let guessed_index = ((guessed_roc as u64) << 16) | sequence as u64;
     if guessed_index > current_index {
+        let delta = guessed_index - current_index;
+        state.replay_window = if delta >= 64 {
+            1
+        } else {
+            (state.replay_window << delta) | 1
+        };
         state.roc = guessed_roc;
         state.highest_sequence = Some(sequence);
+    } else if current_index - guessed_index < 64 {
+        state.replay_window |= 1u64 << (current_index - guessed_index);
     }
 }
 
@@ -770,10 +810,9 @@ pub fn parse_crypto_attribute(line: &str) -> Result<(u32, String, String)> {
     let parts: Vec<&str> = rest.splitn(3, ' ').collect();
 
     if parts.len() < 3 {
-        return Err(SrtpError::CryptoAttributeParseError(format!(
-            "格式不完整，期望 TAG SUITE inline:KEY，实际: '{}'",
-            rest
-        )));
+        return Err(SrtpError::CryptoAttributeParseError(
+            "格式不完整，期望 TAG SUITE inline:KEY".to_string(),
+        ));
     }
 
     let tag: u32 = parts[0].parse().map_err(|e| {
@@ -785,10 +824,9 @@ pub fn parse_crypto_attribute(line: &str) -> Result<(u32, String, String)> {
     // 解析 inline:KEY — 可能包含 |lifetime 等附加参数
     let key_part = parts[2];
     if !key_part.starts_with("inline:") {
-        return Err(SrtpError::CryptoAttributeParseError(format!(
-            "缺少 'inline:' 前缀: '{}'",
-            key_part
-        )));
+        return Err(SrtpError::CryptoAttributeParseError(
+            "缺少 inline 前缀".to_string(),
+        ));
     }
 
     let key_with_params = &key_part[7..]; // 跳过 "inline:"
@@ -931,6 +969,49 @@ mod tests {
     }
 
     /// 测试创建新的加密套件
+
+    #[test]
+    fn reordered_packets_after_rollover_use_current_roc() {
+        for suite in [SrtpSuite::AesCm128HmacSha180, SrtpSuite::AeadAes128Gcm] {
+            let mut sender = SrtpCryptoSuite::new_with_suite(suite);
+            let mut receiver = sender.clone();
+            let last = sender
+                .protect_rtp(&make_rtp_packet(1, 65535, b"last"))
+                .unwrap();
+            let zero = sender.protect_rtp(&make_rtp_packet(1, 0, b"zero")).unwrap();
+            let one = sender.protect_rtp(&make_rtp_packet(1, 1, b"one")).unwrap();
+            receiver.unprotect_rtp(&last).unwrap();
+            receiver.unprotect_rtp(&one).unwrap();
+            receiver.unprotect_rtp(&zero).unwrap();
+            assert!(receiver.unprotect_rtp(&zero).is_err());
+        }
+    }
+
+    #[test]
+    fn replay_window_and_failed_authentication_for_both_suites() {
+        for suite in [SrtpSuite::AesCm128HmacSha180, SrtpSuite::AeadAes128Gcm] {
+            let mut sender = SrtpCryptoSuite::new_with_suite(suite);
+            let mut receiver = sender.clone();
+            let first = sender.protect_rtp(&make_rtp_packet(1, 1, b"one")).unwrap();
+            let second = sender.protect_rtp(&make_rtp_packet(1, 2, b"two")).unwrap();
+            let mut forged = second.clone();
+            forged[8..12].copy_from_slice(&99u32.to_be_bytes());
+            assert!(receiver.unprotect_rtp(&forged).is_err());
+            assert!(receiver.stream_states.is_empty());
+            receiver.unprotect_rtp(&second).unwrap();
+            receiver.unprotect_rtp(&first).unwrap(); // valid out-of-order packet
+            assert!(receiver.unprotect_rtp(&first).is_err());
+            let later = sender
+                .protect_rtp(&make_rtp_packet(1, 100, b"later"))
+                .unwrap();
+            receiver.unprotect_rtp(&later).unwrap();
+            assert!(receiver.unprotect_rtp(&second).is_err());
+            assert!(sender
+                .protect_rtp(&make_rtp_packet(1, 100, b"nonce reuse"))
+                .is_err());
+        }
+    }
+
     #[test]
     fn test_new_crypto_suite() {
         let suite = SrtpCryptoSuite::new();
@@ -984,6 +1065,7 @@ mod tests {
         rtp_packet.extend_from_slice(b"Hello, SRTP!"); // Payload
 
         // 加密
+        let mut receiver = suite.clone();
         let srtp_packet = suite.protect_rtp(&rtp_packet).unwrap();
 
         // SRTP 包应该比 RTP 包多 10 字节（认证标签）
@@ -996,7 +1078,7 @@ mod tests {
         );
 
         // 解密
-        let decrypted = suite.unprotect_rtp(&srtp_packet).unwrap();
+        let decrypted = receiver.unprotect_rtp(&srtp_packet).unwrap();
         assert_eq!(decrypted, rtp_packet);
     }
 
@@ -1005,14 +1087,15 @@ mod tests {
     fn test_gcm_roundtrip() {
         let mut suite = SrtpCryptoSuite::new_with_suite(SrtpSuite::AeadAes128Gcm);
 
-        let mut rtp_packet = make_rtp_packet(0x12345678, 1, b"Hello, GCM SRTP!");
+        let rtp_packet = make_rtp_packet(0x12345678, 1, b"Hello, GCM SRTP!");
 
+        let mut receiver = suite.clone();
         let srtp_packet = suite.protect_rtp(&rtp_packet).unwrap();
 
         // GCM 认证标签 16 字节
         assert_eq!(srtp_packet.len(), rtp_packet.len() + GCM_AUTH_TAG_LEN);
 
-        let decrypted = suite.unprotect_rtp(&srtp_packet).unwrap();
+        let decrypted = receiver.unprotect_rtp(&srtp_packet).unwrap();
         assert_eq!(decrypted, rtp_packet);
     }
 
@@ -1064,7 +1147,10 @@ mod tests {
     #[test]
     fn test_gcm_sdes_28_byte_key_roundtrip() {
         let key_b64 = "T0iUsU5QGv2+xlg/kQvFyiymq969VLNgWOjf+w==";
-        assert_eq!(BASE64.decode(key_b64).unwrap().len(), MASTER_KEY_LEN + GCM_SALT_LEN);
+        assert_eq!(
+            BASE64.decode(key_b64).unwrap().len(),
+            MASTER_KEY_LEN + GCM_SALT_LEN
+        );
 
         let restored =
             SrtpCryptoSuite::from_sdes_with_suite(SrtpSuite::AeadAes128Gcm, key_b64).unwrap();
@@ -1154,7 +1240,9 @@ mod tests {
             master_key: [0u8; MASTER_KEY_LEN],
             master_salt: [0u8; MASTER_SALT_LEN],
             session_key: [0u8; SESSION_KEY_LEN],
-            session_salt: [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0, 0],
+            session_salt: [
+                0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0, 0,
+            ],
             session_auth_key: [0u8; SESSION_AUTH_KEY_LEN],
             stream_states: HashMap::new(),
         };

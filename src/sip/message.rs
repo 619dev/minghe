@@ -135,6 +135,9 @@ impl MessageService {
 
     /// 获取分机的写入通道
     fn get_writer(&self, extension: &str) -> Option<mpsc::Sender<Vec<u8>>> {
+        if !self.registrar.is_registered(extension) {
+            return None;
+        }
         let writers = self
             .connection_writers
             .read()
@@ -145,7 +148,9 @@ impl MessageService {
     /// 检查分机号是否在有效号码范围内
     fn is_valid_extension(&self, extension: &str) -> bool {
         match extension.parse::<u32>() {
-            Ok(num) => num >= self.range_start && num <= self.range_end,
+            Ok(num) => {
+                num.to_string() == extension && num >= self.range_start && num <= self.range_end
+            }
             Err(_) => false,
         }
     }
@@ -224,7 +229,7 @@ impl MessageService {
                 &server_contact_uri(from_ext, &self.domain),
                 &server_contact_uri(from_ext, &self.domain),
             );
-            match writer.send(forwarded.into_bytes()).await {
+            match writer.try_send(forwarded.into_bytes()) {
                 Ok(_) => {
                     tracing::info!("MESSAGE 已投递给在线分机 {}", callee_ext);
                     return parser::build_response(request_text, 200, "OK");
@@ -269,10 +274,13 @@ impl MessageService {
         // 1) 发送方速率限制（固定窗口：每 SENDER_RATE_WINDOW_SECS 最多 SENDER_RATE_LIMIT 条，
         //    防止单个已认证分机快速灌入离线队列）
         {
-            let mut rates = self
-                .sender_rates
-                .write()
-                .expect("sender_rates 锁中毒");
+            let mut rates = self.sender_rates.write().expect("sender_rates 锁中毒");
+            rates.retain(|_, window| {
+                now < window.window_start.saturating_add(SENDER_RATE_WINDOW_SECS)
+            });
+            if !rates.contains_key(from_ext) && rates.len() >= 4096 {
+                return StoreOutcome::RateLimited;
+            }
             let win = rates
                 .entry(from_ext.to_string())
                 .or_insert(SenderRateWindow {
@@ -369,52 +377,20 @@ impl MessageService {
     pub async fn deliver_offline_messages(&self, extension: &str) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let messages: Vec<OfflineMessage> = {
-            let mut map = self
-                .offline_messages
-                .write()
-                .expect("offline_messages 锁中毒");
-            map.remove(extension)
-                .unwrap_or_default()
-                .into_iter()
-                // TTL：已过期的离线消息不再投递，直接释放内存
-                .filter(|m| now < m.received_at.saturating_add(OFFLINE_MSG_TTL_SECS))
-                .collect()
-        };
-
-        if messages.is_empty() {
-            return;
-        }
-
-        // 分机未在线（例如注册后连接立即断开），把消息放回队列
-        let Some(writer) = self.get_writer(extension) else {
-            tracing::warn!(
-                "分机 {} 注册后无可用连接，离线消息保留待下次投递",
-                extension
-            );
-            let mut map = self
-                .offline_messages
-                .write()
-                .expect("offline_messages 锁中毒");
-            let queue = map.entry(extension.to_string()).or_default();
-            // 旧消息（本次未投递）排在新到达消息之前，维护全局顺序
-            merge_back(queue, messages.into());
+            .unwrap_or_default()
+            .as_secs();
+        // Keep queued messages accounted for until delivery succeeds. Nonblocking sends
+        // prevent stalled clients and repeated REGISTERs from spawning unbounded work.
+        let mut map = self.offline_messages.write().unwrap();
+        prune_expired(&mut map, now);
+        let Some(queue) = map.get_mut(extension) else {
             return;
         };
-
         let target_uri = registered_contact_uri(extension, &self.domain, &self.registrar);
-        let mut pending: VecDeque<OfflineMessage> = messages.into();
-        let mut delivered = 0usize;
-        while let Some(msg) = pending.pop_front() {
-            tracing::debug!(
-                "补投离线消息: from={}, received_at={}",
-                msg.from_ext,
-                msg.received_at
-            );
-            // 重写 From 为原始发送方（补投时主叫分机号同样不信任离线请求里的 From 头，
-            // 而以暂存时记录的身份为准）
+        while let Some(msg) = queue.front() {
+            let Some(writer) = self.get_writer(extension) else {
+                break;
+            };
             let forwarded = build_outbound_request_with_from(
                 &msg.original_request,
                 &target_uri,
@@ -422,30 +398,14 @@ impl MessageService {
                 &server_contact_uri(&msg.from_ext, &self.domain),
                 &server_contact_uri(&msg.from_ext, &self.domain),
             );
-            match writer.send(forwarded.into_bytes()).await {
-                Ok(_) => delivered += 1,
-                Err(e) => {
-                    tracing::error!(
-                        "补投离线消息给 {} 失败: {}，剩余 {} 条写回队列待下次投递",
-                        extension,
-                        e,
-                        pending.len() + 1
-                    );
-                    // 未送达的消息（含当前失败这条）写回队列，避免丢消息。
-                    // 用 merge_back 保证：本次未送达的旧消息排在前，并发新到达的消息排在后，
-                    // 裁剪从头（最旧）进行，不会误删刚收到的消息。
-                    pending.push_front(msg);
-                    let mut map = self
-                        .offline_messages
-                        .write()
-                        .expect("offline_messages 锁中毒");
-                    let queue = map.entry(extension.to_string()).or_default();
-                    merge_back(queue, pending);
-                    break;
-                }
+            if writer.try_send(forwarded.into_bytes()).is_err() {
+                break;
             }
+            queue.pop_front();
         }
-        tracing::info!("已向分机 {} 补投 {} 条离线消息", extension, delivered);
+        if queue.is_empty() {
+            map.remove(extension);
+        }
     }
 }
 
@@ -465,6 +425,12 @@ mod tests {
             1000,
             2000,
         ));
+        registrar.register(super::super::registrar::Registration {
+            extension: "1002".into(),
+            contact: "sip:1002@example.com".into(),
+            expires_at: u64::MAX,
+            transport_addr: "127.0.0.1:5061".parse().unwrap(),
+        });
         let writers = Arc::new(RwLock::new(HashMap::new()));
         let svc = Arc::new(MessageService::new(
             registrar,
@@ -777,10 +743,7 @@ mod tests {
             vec![om("1001", "oldA", 5), om("1001", "oldB", 6)].into();
         let mut queue: VecDeque<OfflineMessage> = vec![om("1002", "newX", 7)].into();
         merge_back(&mut queue, pending);
-        let names: Vec<&str> = queue
-            .iter()
-            .map(|m| m.original_request.as_str())
-            .collect();
+        let names: Vec<&str> = queue.iter().map(|m| m.original_request.as_str()).collect();
         assert_eq!(names, vec!["oldA", "oldB", "newX"]);
     }
 
@@ -886,7 +849,13 @@ mod tests {
             let mut map = svc.offline_messages.write().unwrap();
             // 大量过期消息占据全局容量
             let queue: VecDeque<OfflineMessage> = (0..100)
-                .map(|i| om("9999", &format!("stale {}", i), now - OFFLINE_MSG_TTL_SECS - 1))
+                .map(|i| {
+                    om(
+                        "9999",
+                        &format!("stale {}", i),
+                        now - OFFLINE_MSG_TTL_SECS - 1,
+                    )
+                })
                 .collect();
             map.insert("1003".to_string(), queue);
         }

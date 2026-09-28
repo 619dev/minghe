@@ -10,27 +10,22 @@ authors = ["MingHe Contributors"]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# SIP parsing
-rsip = "0.4"
-anyhow = "1"
-
 # TLS — 显式禁用默认 features，避免编译 aws-lc-rs（其 C 库 aws-lc-sys
 # 在旧版 gcc 上编译失败），只启用项目实际使用的 ring provider。
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-rustls-pemfile = "2"
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rcgen = { version = "0.13", features = ["default"] }
 time = "0.3"
 
 # Crypto for SRTP & Digest auth
 aes = "0.8"
-ctr = "0.9"
 hmac = "0.12"
 sha1 = "0.10"
 md-5 = "0.10"
 rand = "0.8"
 base64 = "0.22"
 hex = "0.4"
+subtle = "2"
 # RFC 7714 AEAD_AES_128_GCM SRTP 套件
 aes-gcm = "0.10"
 
@@ -46,5 +41,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 
 # Utilities
-bytes = "1"
 uuid = { version = "1", features = ["v4"] }

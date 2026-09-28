@@ -13,7 +13,7 @@ COPY Cargo.toml Cargo.lock* ./
 # 创建虚拟 main.rs 来预编译依赖
 RUN mkdir -p src && \
     echo 'fn main() { println!("placeholder"); }' > src/main.rs && \
-    cargo build --release 2>/dev/null || true && \
+    cargo build --release --locked && \
     rm -rf src
 
 # 复制实际源码并编译
@@ -21,7 +21,7 @@ COPY src/ src/
 
 # 触发重新编译（因为 src/main.rs 变了）
 RUN touch src/main.rs && \
-    cargo build --release
+    cargo build --release --locked
 
 # ---- 阶段 2: 运行 ----
 FROM debian:bookworm-slim
@@ -29,7 +29,7 @@ FROM debian:bookworm-slim
 # 安装最小运行时依赖
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        ca-certificates \
+        ca-certificates procps \
         && \
     rm -rf /var/lib/apt/lists/*
 
@@ -47,7 +47,7 @@ RUN mkdir -p /app/certs /app/config && \
     chown -R minghe:minghe /app
 
 # 默认配置文件（可被卷挂载覆盖）
-COPY config.toml /app/config/config.toml
+COPY config.template.toml /app/config/config.toml
 
 # 切换到非 root 用户
 USER minghe
@@ -55,7 +55,7 @@ USER minghe
 # SIP TLS 端口
 EXPOSE 5061/tcp
 
-# RTP 媒体端口范围（默认约 10 通并发）
+# RTP 媒体端口范围（默认约 5 通并发）
 EXPOSE 20000-20020/udp
 
 # 健康检查：检查进程是否存活

@@ -6,7 +6,6 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Mutex;
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
@@ -37,7 +36,6 @@ pub struct MediaRelayManager {
     /// RTP 端口范围结束
     port_end: u16,
     /// 下一个可分配的端口（原子操作）
-    next_port: AtomicU16,
     /// 服务器媒体地址
     media_addr: String,
     /// 活跃的中继会话 (session_id -> RelaySession)
@@ -58,91 +56,50 @@ impl MediaRelayManager {
         Self {
             port_start,
             port_end,
-            next_port: AtomicU16::new(port_start),
             media_addr,
             sessions: Mutex::new(HashMap::new()),
             shutdown_senders: Mutex::new(HashMap::new()),
         }
     }
 
-    /// 分配一对 RTP/RTCP 端口（偶数为 RTP，偶数+1 为 RTCP）
-    fn allocate_port_pair(&self) -> Option<u16> {
-        let mut attempts = 0;
-        loop {
-            let port = self.next_port.fetch_add(2, Ordering::SeqCst);
-            if port >= self.port_end {
-                // 回绕
-                let _ = self.next_port.compare_exchange(
-                    port + 2,
-                    self.port_start,
-                    Ordering::SeqCst,
-                    Ordering::Relaxed,
-                );
-                attempts += 1;
-                if attempts > 3 {
-                    tracing::error!("RTP 端口池已耗尽");
-                    return None;
-                }
-                continue;
-            }
-            if port % 2 == 0 {
-                tracing::debug!("分配 RTP 端口: {}", port);
-                return Some(port);
-            }
-        }
-    }
-
-    /// 创建新的中继会话（如果已存在则返回现有会话）
+    /// Reserve both ports under one lock; never reuse ports held by another call.
     pub fn create_session(&self, session_id: String) -> Option<RelaySession> {
-        // 检查是否已有此会话
-        {
-            let sessions = self.sessions.lock().unwrap();
-            if let Some(existing) = sessions.get(&session_id) {
-                tracing::debug!("媒体中继会话已存在: {}", session_id);
-                return Some(existing.clone());
-            }
+        let mut sessions = self.sessions.lock().unwrap();
+        if sessions.contains_key(&session_id) {
+            return None;
         }
-
-        let caller_port = self.allocate_port_pair()?;
-        let callee_port = self.allocate_port_pair()?;
-
+        let used: std::collections::HashSet<u16> = sessions
+            .values()
+            .flat_map(|s| [s.caller_port, s.callee_port])
+            .collect();
+        let mut free =
+            (self.port_start..self.port_end).filter(|p| *p != 0 && p % 2 == 0 && !used.contains(p));
         let session = RelaySession {
             session_id: session_id.clone(),
-            caller_port,
-            callee_port,
+            caller_port: free.next()?,
+            callee_port: free.next()?,
             caller_addr: None,
             callee_addr: None,
         };
-
-        let mut sessions = self.sessions.lock().unwrap();
-        sessions.insert(session_id.clone(), session.clone());
-        tracing::info!(
-            "创建媒体中继会话 {}: 主叫侧 SDP 端口={}, 被叫侧 SDP 端口={}。这两个 UDP 端口都必须能被客户端访问",
-            session_id,
-            caller_port,
-            callee_port
-        );
-
+        sessions.insert(session_id, session.clone());
         Some(session)
     }
 
     /// 移除中继会话并停止中继任务
     pub fn remove_session(&self, session_id: &str) -> Option<RelaySession> {
-        // 发送停止信号
-        {
-            let mut senders = self.shutdown_senders.lock().unwrap();
-            if let Some(tx) = senders.remove(session_id) {
-                let _ = tx.send(true);
-                tracing::debug!("已发送中继停止信号: {}", session_id);
-            }
+        let senders = self.shutdown_senders.lock().unwrap();
+        if let Some(tx) = senders.get(session_id) {
+            let _ = tx.send(true);
+            // Keep ports reserved until the UDP tasks have actually released sockets.
+            return self.sessions.lock().unwrap().get(session_id).cloned();
         }
+        self.sessions.lock().unwrap().remove(session_id)
+    }
 
-        let mut sessions = self.sessions.lock().unwrap();
-        let session = sessions.remove(session_id);
-        if session.is_some() {
-            tracing::info!("移除媒体中继会话: {}", session_id);
-        }
-        session
+    pub fn finish_session(&self, session_id: &str) {
+        let mut senders = self.shutdown_senders.lock().unwrap();
+        senders.remove(session_id);
+        self.sessions.lock().unwrap().remove(session_id);
     }
 
     /// 注册停止信号发送器
@@ -210,16 +167,10 @@ pub async fn run_relay(
     let caller_socket = std::sync::Arc::new(caller_socket);
     let callee_socket = std::sync::Arc::new(callee_socket);
 
-    if let Some(addr) = caller_initial_addr {
-        tracing::info!("[{}] 使用主叫 SDP 媒体地址: {}", call_id, addr);
-    }
-    if let Some(addr) = callee_initial_addr {
-        tracing::info!("[{}] 使用被叫 SDP 媒体地址: {}", call_id, addr);
-    }
-
-    // 共享的远端地址：优先使用 SDP 中声明的地址，收到实际 UDP 包后更新为源地址。
-    let caller_remote = std::sync::Arc::new(tokio::sync::Mutex::new(caller_initial_addr));
-    let callee_remote = std::sync::Arc::new(tokio::sync::Mutex::new(callee_initial_addr));
+    // SDP is untrusted: learn destinations only from authenticated SRTP packets.
+    let _ = (caller_initial_addr, callee_initial_addr);
+    let caller_remote = std::sync::Arc::new(tokio::sync::Mutex::new(None::<SocketAddr>));
+    let callee_remote = std::sync::Arc::new(tokio::sync::Mutex::new(None::<SocketAddr>));
 
     let call_id_str = call_id.to_string();
 
@@ -241,45 +192,20 @@ pub async fn run_relay(
                     if n == 0 {
                         continue;
                     }
-                    // 学习/更新主叫方地址
-                    {
-                        let mut remote = cr1.lock().await;
-                        if *remote != Some(addr) {
-                            tracing::debug!("[{}] 学习到主叫方地址: {}", cid1, addr);
-                            *remote = Some(addr);
-                        }
-                    }
+                    let rtp = match decrypt_caller.as_mut().map(|c| c.unprotect_rtp(&buf[..n])) {
+                        Some(Ok(rtp)) => rtp,
+                        _ => continue,
+                    };
+                    *cr1.lock().await = Some(addr);
                     // SRTP 模式：解密 → 重加密
                     let callee_addr = {
                         let remote = cr2.lock().await;
                         *remote
                     };
                     if let Some(dest) = callee_addr {
-                        let packet = &buf[..n];
-                        let outbound = match (decrypt_caller.as_mut(), encrypt_callee.as_mut()) {
-                            (Some(decrypt), Some(encrypt)) => match decrypt.unprotect_rtp(packet) {
-                                Ok(rtp) => match encrypt.protect_rtp(&rtp) {
-                                    Ok(srtp) => Some(srtp),
-                                    Err(e) => {
-                                        tracing::debug!("[{}] 主叫侧重加密失败: {}", cid1, e);
-                                        None
-                                    }
-                                },
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "[{}] 主叫侧 SRTP 解密失败: {}, {}",
-                                        cid1,
-                                        e,
-                                        describe_rtp_like_packet(packet)
-                                    );
-                                    None
-                                }
-                            },
-                            _ => {
-                                tracing::debug!("[{}] 缺少 SRTP crypto，丢弃主叫侧媒体包", cid1);
-                                None
-                            }
-                        };
+                        let outbound = encrypt_callee
+                            .as_mut()
+                            .and_then(|c| c.protect_rtp(&rtp).ok());
                         if let Some(outbound) = outbound {
                             if let Err(e) = cs2.send_to(&outbound, dest).await {
                                 tracing::debug!("转发到被叫失败: {}", e);
@@ -321,45 +247,20 @@ pub async fn run_relay(
                     if n == 0 {
                         continue;
                     }
-                    // 学习/更新被叫方地址
-                    {
-                        let mut remote = cr3.lock().await;
-                        if *remote != Some(addr) {
-                            tracing::debug!("[{}] 学习到被叫方地址: {}", cid2, addr);
-                            *remote = Some(addr);
-                        }
-                    }
+                    let rtp = match decrypt_callee.as_mut().map(|c| c.unprotect_rtp(&buf[..n])) {
+                        Some(Ok(rtp)) => rtp,
+                        _ => continue,
+                    };
+                    *cr3.lock().await = Some(addr);
                     // SRTP 模式：解密 → 重加密
                     let caller_addr = {
                         let remote = cr4.lock().await;
                         *remote
                     };
                     if let Some(dest) = caller_addr {
-                        let packet = &buf[..n];
-                        let outbound = match (decrypt_callee.as_mut(), encrypt_caller.as_mut()) {
-                            (Some(decrypt), Some(encrypt)) => match decrypt.unprotect_rtp(packet) {
-                                Ok(rtp) => match encrypt.protect_rtp(&rtp) {
-                                    Ok(srtp) => Some(srtp),
-                                    Err(e) => {
-                                        tracing::debug!("[{}] 被叫侧重加密失败: {}", cid2, e);
-                                        None
-                                    }
-                                },
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "[{}] 被叫侧 SRTP 解密失败: {}, {}",
-                                        cid2,
-                                        e,
-                                        describe_rtp_like_packet(packet)
-                                    );
-                                    None
-                                }
-                            },
-                            _ => {
-                                tracing::debug!("[{}] 缺少 SRTP crypto，丢弃被叫侧媒体包", cid2);
-                                None
-                            }
-                        };
+                        let outbound = encrypt_caller
+                            .as_mut()
+                            .and_then(|c| c.protect_rtp(&rtp).ok());
                         if let Some(outbound) = outbound {
                             if let Err(e) = cs4.send_to(&outbound, dest).await {
                                 tracing::debug!("转发到主叫失败: {}", e);
@@ -382,39 +283,37 @@ pub async fn run_relay(
         }
     });
 
-    // 等待任一任务结束或呼叫清理信号
+    // Join each task exactly once and release sockets before returning ports to the pool.
     tokio::select! {
-        _ = &mut task1 => {},
-        _ = &mut task2 => {},
-        _ = shutdown_rx.changed() => {},
+        _ = &mut task1 => { task2.abort(); let _ = task2.await; },
+        _ = &mut task2 => { task1.abort(); let _ = task1.await; },
+        _ = shutdown_rx.changed() => {
+            task1.abort(); task2.abort();
+            let _ = tokio::join!(task1, task2);
+        },
     }
-
-    task1.abort();
-    task2.abort();
 
     tracing::info!("媒体中继已停止: Call-ID={}", call_id_str);
     Ok(())
 }
 
-fn describe_rtp_like_packet(packet: &[u8]) -> String {
-    if packet.len() < 12 {
-        return format!("packet_len={}", packet.len());
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let version = packet[0] >> 6;
-    let payload_byte = packet[1];
-    let payload_type = payload_byte & 0x7f;
-    let marker = packet[1] & 0x80 != 0;
-    let sequence = u16::from_be_bytes([packet[2], packet[3]]);
-    let ssrc = u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
-    format!(
-        "packet_len={}, rtp_version={}, marker={}, payload_byte={}, payload_type={}, seq={}, ssrc=0x{:08x}",
-        packet.len(),
-        version,
-        marker,
-        payload_byte,
-        payload_type,
-        sequence,
-        ssrc
-    )
+    #[test]
+    fn port_pool_reserves_without_overlap_and_releases() {
+        let manager = MediaRelayManager::new(20000, 20008, "127.0.0.1".into());
+        let a = manager.create_session("a".into()).unwrap();
+        let b = manager.create_session("b".into()).unwrap();
+        assert_ne!(a.caller_port, b.caller_port);
+        assert_ne!(a.callee_port, b.callee_port);
+        assert!(manager.create_session("c".into()).is_none());
+        assert!(manager.create_session("a".into()).is_none());
+        manager.remove_session("a");
+        assert!(manager.create_session("c".into()).is_some());
+        let edge = MediaRelayManager::new(65530, 65535, "127.0.0.1".into());
+        assert!(edge.create_session("x".into()).is_some());
+        assert!(edge.create_session("y".into()).is_none());
+    }
 }

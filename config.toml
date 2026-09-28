@@ -15,7 +15,8 @@ host = "minghe.local"
 range_start = 1000
 range_end = 2000
 # 所有分机的默认密码（未在 [passwords] 中单独配置的分机使用此密码）
-default_password = "minghe@2024"
+# 必须替换占位值，至少 12 字节；知道共享密码的人可以登录所有使用它的分机。
+default_password = "CHANGE_ME_TO_A_STRONG_PASSWORD"
 
 [tls]
 # 证书路径（留空则自动生成自签名证书）
@@ -29,13 +30,13 @@ rtp_port_start = 20000
 rtp_port_end = 20020
 # 服务器公网/内网 IP（用于 SDP 中的媒体地址）
 # 不要留空。请替换为 Bria、Linkvil 等客户端能访问到的公网或内网 IP。
-# Docker、云平台或多网卡环境下自动检测通常会拿到容器内网 IP，导致接听后无声。
+# 启动时拒绝空值或无效 IP，不执行自动检测。
 media_addr = "CHANGE_ME_MEDIA_IP"
 
 # 单独为分机设置密码（覆盖 default_password）
 # 格式：分机号 = "密码"
 # 未列出的分机使用 default_password
 [passwords]
-# 1001 = "velox@2026"
-# 1002 = "alice@2026"
-# 1003 = "bob@2026"
+# 1001 = "CHANGE_ME_EXTENSION_1001"
+# 1002 = "CHANGE_ME_EXTENSION_1002"
+# 1003 = "CHANGE_ME_EXTENSION_1003"

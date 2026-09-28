@@ -10,8 +10,8 @@
 
 - 🔒 **TLS Signaling Encryption** — SIP over TLS (SIPS) on port 5061, TLS 1.2/1.3
 - 🎵 **SRTP Media Encryption** — AES_CM_128_HMAC_SHA1_80 / AEAD_AES_128_GCM (RFC 7714) with SDES key exchange
-- 🔑 **SIP Digest Authentication** — MD5 digest auth with default and per-extension passwords
-- 📡 **RTP Media Relay** — Transparent server-side relay with address learning
+- 🔑 **SIP Digest Authentication** — MD5 `qop=auth`, expiring nonces and replay protection, with per-extension passwords
+- 📡 **RTP Media Relay** — Server-side decryption and re-encryption; learns addresses only from authenticated SRTP packets
 - 💬 **Extension Instant Messaging** — SIP MESSAGE text exchange; messages are queued while offline and auto-delivered on registration
 - 📱 **Internal Extensions** — 1000–2000 range (configurable), INVITE/BYE/CANCEL/ACK
 - 🌐 **IP Certificates** — No domain required; auto-generates IP-based TLS certificates
@@ -28,7 +28,7 @@
 mkdir -p config
 cp config.template.toml config/config.toml
 
-# 2. Edit config (at minimum, change host and default_password)
+# 2. Edit config (set host, media_addr, default_password and any enabled per-extension passwords)
 vim config/config.toml
 
 # 3. Start
@@ -45,11 +45,15 @@ docker compose logs -f
 ### Build from Source
 
 ```bash
-# Requirements: Rust 1.75+
-cargo build --release
+# Requirements: Rust 1.88+
+cargo build --release --locked
 
-# Run
-./target/release/minghe -c config.toml
+# Prepare local configuration; keep real passwords out of Git
+mkdir -p config
+cp config.template.toml config/config.toml
+chmod 600 config/config.toml
+# Set host, media_addr and all enabled passwords before running
+./target/release/minghe -c config/config.toml
 ```
 
 ## Configuration
@@ -67,7 +71,7 @@ host = "192.168.1.100"          # Your server IP or domain
 [extensions]
 range_start = 1000
 range_end = 2000
-default_password = "YourPassword123"
+default_password = "CHANGE_ME_TO_A_STRONG_PASSWORD"
 
 [tls]
 cert_path = ""                   # Empty = auto-generate self-signed cert
@@ -79,11 +83,11 @@ rtp_port_end = 20020
 media_addr = "192.168.1.100"     # Required: media IP reachable by clients
 ```
 
-> ⚠️ Do not leave `media_addr` empty. In Docker, cloud platforms, or multi-NIC environments, auto-detection often returns a container/private interface address, which can cause calls to connect with no audio. Set it to the public or LAN IP reachable by Bria, Linkvil, and other clients.
+> Replace every enabled `CHANGE_ME…` value with a real random password of at least 12 bytes. `media_addr` must be a valid IP reachable by clients; empty values and domain names are rejected at startup.
 
 > Each call uses two even UDP ports by default, for example `20000/UDP` and `20002/UDP` for the first call. Firewalls, cloud security groups, and container port mappings must allow both.
 
-> The default `20000-20020/udp` range supports about 10 concurrent calls and is friendly to small VPS instances. For more concurrency, expand `config.toml`, Docker port mappings, and firewall/security-group rules together. Do not map `20000-30000/udp` by default on small hosts; Docker may stall while creating thousands of UDP mappings.
+> The default `20000-20020/udp` range supports about 5 concurrent calls and is friendly to small VPS instances. For more concurrency, expand `config.toml`, Docker port mappings, and firewall/security-group rules together. Do not map `20000-30000/udp` by default on small hosts; Docker may stall while creating thousands of UDP mappings.
 
 ### Platform Requirements
 
@@ -98,12 +102,12 @@ If the platform cannot expose a fixed UDP port range, the usual symptom is: exte
 
 ### Per-Extension Passwords
 
-Set individual passwords in `[passwords]`. Extensions not listed use `default_password`:
+Use a different random password for each extension in `[passwords]`. Unlisted extensions use `default_password`; anyone who knows that shared password can log in to those extensions. Replace the placeholders below:
 
 ```toml
 [passwords]
-1001 = "velox@2026"
-1002 = "alice@2026"
+1001 = "CHANGE_ME_EXTENSION_1001"
+1002 = "CHANGE_ME_EXTENSION_1002"
 ```
 
 ### TLS Certificates
@@ -114,6 +118,19 @@ Set individual passwords in `[passwords]`. Extensions not listed use `default_pa
 | **IP Certificate** | `host = "1.2.3.4"` | Auto-detects IP, generates IP SAN certificate |
 | **Domain Certificate** | `host = "sip.example.com"` | Auto-detects domain, generates DNS SAN certificate |
 | **External Certificate** | `cert_path = "/path/to/cert.pem"` | Use Let's Encrypt or other external certs |
+
+## Security and upgrades
+
+See [SECURITY_EN.md](SECURITY_EN.md) ([中文](SECURITY.md)) for the security review and full limits.
+
+- Clients must support Digest `qop=auth` and register on the same TLS connection used for calls and messages. Expired nonces receive a new 401 challenge.
+- Registrations last at most one hour. Each connection binds one account; reconnect to switch accounts. Disconnecting cleans up associated calls.
+- Each caller may initiate up to two concurrent calls; the default media pool supports five calls. Pending calls expire after 120 seconds and established calls after four hours, with cleanup every 30 seconds.
+- Both endpoints must send valid SRTP packets before the server learns their media destinations. Receive-only endpoints need adaptation.
+- Each source IP may send 60 REGISTER requests per minute, including challenges and retries. Each connection may send 300 SIP messages per minute. Evaluate these limits when many devices share a NAT address.
+- The relay decrypts and re-encrypts media, so the server is inside the trust boundary. Media is not end-to-end encrypted.
+
+Updating the source does not publish a new Docker Hub `latest` image. Build from the current source to use these fixes immediately.
 
 ## Client Configuration
 
@@ -133,7 +150,11 @@ Other clients should support SIP over TLS, SDES-SRTP (`AES_CM_128_HMAC_SHA1_80` 
 | Password | Corresponding password |
 | Domain/Realm | Same as `host` in config |
 
-> ⚠️ When using self-signed certificates, you must either **disable TLS certificate verification** in your client or import `certs/server.crt` as a trusted certificate.
+> ⚠️ When using self-signed certificates, import `certs/server.crt` as a trusted certificate and keep TLS verification enabled. Renewed certificates need to be trusted again; use a trusted CA certificate for public deployments.
+
+## Message storage and delivery
+
+Message bodies are limited to 4 KiB and complete MESSAGE requests to 8 KiB. Offline messages stay in memory for up to 24 hours: 100 per recipient (oldest messages are evicted when full) and 10,000 globally. Each sender may queue 120 messages per minute and hold 500 outstanding offline messages. Capacity or rate exhaustion returns 503. A 200 response means server acceptance, not recipient acknowledgement. Delivery resumes after registration and as the write queue drains; restarting the server loses pending messages.
 
 ## Architecture
 
@@ -176,12 +197,13 @@ Other clients should support SIP over TLS, SDES-SRTP (`AES_CM_128_HMAC_SHA1_80` 
 ```
 minghe/
 ├── Cargo.toml                # Project manifest
-├── config.toml               # Default configuration
+├── config.toml               # Example config; replace passwords and media IP
 ├── config.template.toml      # Config template (with detailed comments)
 ├── Dockerfile                # Multi-stage build
 ├── docker-compose.yml        # Container orchestration
 ├── build-and-push.sh         # Multi-arch image build script
-├── .env                      # Docker Compose environment variables
+├── SECURITY.md / SECURITY_EN.md # Security review and upgrade notes
+├── .env                      # Local Compose variables (Git-ignored)
 └── src/
     ├── main.rs               # Entry point, CLI, graceful shutdown
     ├── config.rs             # Config loading and validation
@@ -192,6 +214,7 @@ minghe/
     │   ├── parser.rs         # SIP message parsing and building
     │   ├── registrar.rs      # Digest authentication, registration management
     │   ├── router.rs         # INVITE/ACK/BYE/CANCEL call routing
+    │   ├── message.rs        # Messaging, offline queues and quotas
     │   └── transaction.rs    # Transaction tracking and timeout cleanup
     └── media/
         ├── mod.rs
@@ -212,6 +235,7 @@ sudo chown -R 10001:10001 certs
 
 docker run -d \
   --name minghe-sip \
+  --read-only --cap-drop ALL --security-opt no-new-privileges=true \
   -p 5061:5061/tcp \
   -p 20000-20020:20000-20020/udp \
   -v $(pwd)/config:/app/config:ro \
@@ -228,7 +252,7 @@ docker build -t minghe .
 ### Multi-Arch Build & Push
 
 ```bash
-# Requires depot CLI
+# Requires Depot CLI or Docker Buildx; the script prefers Depot
 # Build and push latest
 ./build-and-push.sh
 
@@ -243,16 +267,16 @@ PUSH=0 ./build-and-push.sh
 
 ```bash
 # Build
-cargo build
+cargo build --locked
 
 # Test
-cargo test
+cargo test --locked
 
 # Debug mode (verbose logging)
-RUST_LOG=debug cargo run
+RUST_LOG=debug cargo run --locked -- -c config/config.toml
 
 # Release build
-cargo build --release
+cargo build --release --locked
 ```
 
 ## Environment Variables
@@ -262,10 +286,13 @@ cargo build --release
 | `RUST_LOG` | `info` | Log level: `error` / `warn` / `info` / `debug` / `trace` |
 | `SIP_PORT` | `5061` | SIP TLS port mapping |
 | `RTP_PORT_START` | `20000` | RTP port range start |
-| `RTP_PORT_END` | `20020` | RTP port range end, supports about 10 concurrent calls by default |
+| `RTP_PORT_END` | `20020` | RTP port range end, supports about 5 concurrent calls by default |
 | `CPU_LIMIT` | `1.0` | Docker Compose CPU limit; works on 1-core VPS by default, can be increased on larger hosts |
 | `MEM_LIMIT` | `512M` | Docker Compose memory limit |
 | `TZ` | `Asia/Shanghai` | Container timezone |
+
+These variables configure Compose mappings and the runtime environment; they do not override TOML settings. Keep SIP/media configuration, port mappings and firewall rules in sync; use matching internal and external SIP ports.
+
 
 ## License
 

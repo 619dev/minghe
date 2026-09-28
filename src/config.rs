@@ -78,9 +78,53 @@ impl AppConfig {
     pub fn load(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("无法读取配置文件 '{}': {}", path, e))?;
-        let config: AppConfig =
-            toml::from_str(&content).map_err(|e| format!("配置文件解析错误 '{}': {}", path, e))?;
+        let config: AppConfig = toml::from_str(&content).map_err(|_| {
+            format!(
+                "配置文件解析错误 '{}'（为避免泄露密码，省略原始内容）",
+                path
+            )
+        })?;
 
+        if config.tls.cert_path.is_empty() != config.tls.key_path.is_empty() {
+            return Err("cert_path 和 key_path 必须同时设置或同时留空".into());
+        }
+        if config.server.host.is_empty()
+            || !config
+                .server
+                .host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b".-:".contains(&b))
+        {
+            return Err("host 必须是有效的域名或 IP，不能包含 SIP 分隔符".into());
+        }
+        for password in
+            std::iter::once(&config.extensions.default_password).chain(config.passwords.values())
+        {
+            if password.len() < 12
+                || password.starts_with("CHANGE_ME")
+                || password == "minghe@2024"
+                || password == "YourPassword123"
+            {
+                return Err("请设置至少 12 字节的强密码，不能使用示例密码".into());
+            }
+        }
+        if config.media.rtp_port_start == 0
+            || config
+                .media
+                .rtp_port_end
+                .saturating_sub(config.media.rtp_port_start)
+                < 4
+        {
+            return Err("媒体端口范围至少需要两个非零偶数 RTP 端口".into());
+        }
+        if config
+            .extensions
+            .range_end
+            .saturating_sub(config.extensions.range_start)
+            >= 10000
+        {
+            return Err("分机范围最多允许 10000 个号码".into());
+        }
         // 基本校验
         if config.extensions.range_start > config.extensions.range_end {
             return Err(format!(
@@ -117,14 +161,11 @@ impl AppConfig {
         // 校验独立密码中的分机号是否在范围内
         for (ext_str, _) in &config.passwords {
             if let Ok(ext_num) = ext_str.parse::<u32>() {
-                if ext_num < config.extensions.range_start || ext_num > config.extensions.range_end
+                if ext_num.to_string() != *ext_str
+                    || ext_num < config.extensions.range_start
+                    || ext_num > config.extensions.range_end
                 {
-                    tracing::warn!(
-                        "密码配置中的分机 {} 不在有效范围 {}-{} 内，将被忽略",
-                        ext_str,
-                        config.extensions.range_start,
-                        config.extensions.range_end
-                    );
+                    return Err("独立密码的分机号必须是范围内的规范十进制号码".into());
                 }
             } else {
                 return Err(
@@ -182,5 +223,34 @@ impl AppConfig {
                 "127.0.0.1".to_string()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn rejects_unsafe_configuration_without_echoing_secrets() {
+        let template = include_str!("../config.template.toml");
+        let valid = template.replace("CHANGE_ME_TO_A_STRONG_PASSWORD", "test-only-long-password");
+        let path =
+            std::env::temp_dir().join(format!("minghe-config-{}.toml", uuid::Uuid::new_v4()));
+        std::fs::write(&path, &valid).unwrap();
+        assert!(AppConfig::load(path.to_str().unwrap()).is_ok());
+        for bad in [
+            template.to_string(),
+            valid.replace("test-only-long-password", "short"),
+            valid.replace("key_path = \"\"", "key_path = \"key.pem\""),
+            valid.replace("rtp_port_end = 20020", "rtp_port_end = 20002"),
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(AppConfig::load(path.to_str().unwrap()).is_err());
+        }
+        std::fs::write(&path, "password = 'DO_NOT_LOG_THIS_SECRET'\nINVALID").unwrap();
+        let error = AppConfig::load(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("DO_NOT_LOG_THIS_SECRET"));
+        std::fs::remove_file(path).unwrap();
     }
 }
