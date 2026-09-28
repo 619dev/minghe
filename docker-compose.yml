@@ -26,7 +26,6 @@ services:
     cap_drop:
       - ALL
     read_only: true
-    pids_limit: 128
 
     # 端口映射
     ports:
