@@ -13,9 +13,7 @@
 
 services:
   minghe:
-    # 从当前源码构建，避免误用仍采用 SDES 的旧 latest 镜像
-    build: .
-    image: minghe:local
+    image: facilisvelox/minghe:latest
 
     # 容器名称
     container_name: minghe-sip
