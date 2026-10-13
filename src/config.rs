@@ -1,10 +1,9 @@
 //! 配置模块
 //!
-//! 从 config.toml 加载服务器配置，包括 SIP 服务、分机范围、TLS 证书和媒体中继等设置。
+//! 从 config.toml 加载服务器配置，包括 SIP 服务、分机范围和 TLS 证书；旧媒体配置仅为迁移读取并忽略。
 
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::net::UdpSocket;
 
 /// 应用程序顶层配置
 #[derive(Debug, Clone, Deserialize)]
@@ -15,8 +14,9 @@ pub struct AppConfig {
     pub extensions: ExtensionConfig,
     /// TLS 证书配置
     pub tls: TlsConfig,
-    /// 媒体中继配置
-    pub media: MediaConfig,
+    /// 旧版本媒体中继配置，仅为升级兼容保留，永不启用。
+    #[serde(default)]
+    pub media: Option<toml::Value>,
     /// 分机独立密码（可选，覆盖 default_password）
     #[serde(default)]
     pub passwords: HashMap<String, String>,
@@ -62,17 +62,6 @@ pub struct TlsConfig {
     pub key_path: String,
 }
 
-/// 媒体（RTP）中继配置
-#[derive(Debug, Clone, Deserialize)]
-pub struct MediaConfig {
-    /// RTP 端口范围起始
-    pub rtp_port_start: u16,
-    /// RTP 端口范围结束
-    pub rtp_port_end: u16,
-    /// 服务器媒体地址（用于 SDP，留空则自动检测本机 IP）
-    pub media_addr: String,
-}
-
 impl AppConfig {
     /// 从指定路径加载并解析 TOML 配置文件
     pub fn load(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
@@ -108,15 +97,6 @@ impl AppConfig {
                 return Err("请设置至少 12 字节的强密码，不能使用示例密码".into());
             }
         }
-        if config.media.rtp_port_start == 0
-            || config
-                .media
-                .rtp_port_end
-                .saturating_sub(config.media.rtp_port_start)
-                < 4
-        {
-            return Err("媒体端口范围至少需要两个非零偶数 RTP 端口".into());
-        }
         if config
             .extensions
             .range_end
@@ -134,28 +114,8 @@ impl AppConfig {
             .into());
         }
 
-        if config.media.rtp_port_start > config.media.rtp_port_end {
-            return Err(format!(
-                "RTP 端口范围无效: rtp_port_start ({}) > rtp_port_end ({})",
-                config.media.rtp_port_start, config.media.rtp_port_end
-            )
-            .into());
-        }
-
-        if config.media.rtp_port_start % 2 != 0 {
-            return Err("RTP 端口起始必须为偶数（RTP 使用偶数端口，RTCP 使用奇数端口）".into());
-        }
-
-        if config.media.media_addr.trim().is_empty() {
-            return Err("media_addr 不能为空。请填写客户端可访问的服务器公网或内网 IP，否则接听后可能无声。".into());
-        }
-
-        if config.media.media_addr.parse::<std::net::IpAddr>().is_err() {
-            return Err(format!(
-                "media_addr '{}' 不是有效 IP。请填写 Bria、Linkvil 等客户端可访问的公网或内网 IP。",
-                config.media.media_addr
-            )
-            .into());
+        if config.media.is_some() {
+            tracing::warn!("[media] 已停用：端到端模式不分配服务器媒体端口；请从配置删除旧媒体节");
         }
 
         // 校验独立密码中的分机号是否在范围内
@@ -196,34 +156,6 @@ impl AppConfig {
             &self.extensions.default_password
         }
     }
-
-    /// 获取媒体地址
-    ///
-    /// 如果配置中 `media_addr` 为空，则自动检测本机 IP 地址。
-    pub fn get_media_addr(&self) -> String {
-        if !self.media.media_addr.is_empty() {
-            return self.media.media_addr.clone();
-        }
-
-        // 自动检测本机 IP
-        match UdpSocket::bind("0.0.0.0:0") {
-            Ok(socket) => {
-                if socket.connect("8.8.8.8:80").is_ok() {
-                    if let Ok(local_addr) = socket.local_addr() {
-                        let ip = local_addr.ip().to_string();
-                        tracing::info!("自动检测到本机 IP 地址: {}", ip);
-                        return ip;
-                    }
-                }
-                tracing::warn!("无法自动检测本机 IP，使用 127.0.0.1");
-                "127.0.0.1".to_string()
-            }
-            Err(e) => {
-                tracing::warn!("无法创建 UDP socket 检测本机 IP: {}，使用 127.0.0.1", e);
-                "127.0.0.1".to_string()
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -237,11 +169,18 @@ mod tests {
             std::env::temp_dir().join(format!("minghe-config-{}.toml", uuid::Uuid::new_v4()));
         std::fs::write(&path, &valid).unwrap();
         assert!(AppConfig::load(path.to_str().unwrap()).is_ok());
+        // Media configuration is optional; legacy values never start a relay.
+        std::fs::write(
+            &path,
+            format!("{valid}\n[media]\nmedia_addr = ''\nrtp_port_start = 0\n"),
+        )
+        .unwrap();
+        assert!(AppConfig::load(path.to_str().unwrap()).is_ok());
         for bad in [
             template.to_string(),
             valid.replace("test-only-long-password", "short"),
             valid.replace("key_path = \"\"", "key_path = \"key.pem\""),
-            valid.replace("rtp_port_end = 20020", "rtp_port_end = 20002"),
+            valid.replace("range_end = 2000", "range_end = 999"),
         ] {
             std::fs::write(&path, bad).unwrap();
             assert!(AppConfig::load(path.to_str().unwrap()).is_err());

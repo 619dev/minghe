@@ -27,3 +27,9 @@
 # 编辑器备份
 *.bak
 *.orig
+
+# Endpoint identities and replay state must never reach the server repository.
+/e2ee-keys/
+__pycache__/
+*.pyc
+.venv/

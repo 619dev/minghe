@@ -211,6 +211,15 @@ impl MessageService {
             return parser::build_response(request_text, 413, "Message Too Large");
         }
 
+        let content_type =
+            parser::extract_header_value(request_text, "Content-Type").unwrap_or_default();
+        if super::e2ee::validate_message(&content_type, &body).is_err()
+            || parser::extract_header_value(request_text, "Content-Transfer-Encoding")
+                .is_some_and(|value| !value.eq_ignore_ascii_case("binary"))
+        {
+            return parser::build_response(request_text, 415, "Unsupported Media Type");
+        }
+
         tracing::info!(
             "收到 MESSAGE: {} -> {} ({} 字节)",
             from_ext,
@@ -245,7 +254,16 @@ impl MessageService {
         // 只要分机号在配置的 range_start/range_end 范围内即视为合法（离线消息本就是
         // 发给未登录分机的，不要求其当前已注册）；内存防护由 TTL、发送方速率/配额、
         // 请求总长与全局条数上限共同兜底。
-        match self.store_offline_message(&callee_ext, from_ext, request_text) {
+        // Store a sanitized request: no passwords/Digest material or forged identity
+        // in offline queues. The encrypted body remains exactly as received.
+        let stored = build_outbound_request_with_from(
+            request_text,
+            &server_contact_uri(&callee_ext, &self.domain),
+            &self.domain,
+            &server_contact_uri(from_ext, &self.domain),
+            &server_contact_uri(from_ext, &self.domain),
+        );
+        match self.store_offline_message(&callee_ext, from_ext, &stored) {
             StoreOutcome::Stored => {
                 // 回 200 OK：服务端已接收并负责稍后补投（202 Accepted 会令部分客户端异常）
                 parser::build_response(request_text, 200, "OK")
@@ -443,6 +461,11 @@ mod tests {
     }
 
     fn build_message(from: &str, to: &str, body: &str) -> String {
+        let body = if body.trim().is_empty() {
+            body.to_string()
+        } else {
+            super::super::e2ee::test_jwe(body)
+        };
         format!(
             "MESSAGE sip:{}@example.com SIP/2.0\r\n\
              Via: SIP/2.0/TLS client.example.com;branch=z9hG4bKtest\r\n\
@@ -450,7 +473,7 @@ mod tests {
              To: <sip:{}@example.com>\r\n\
              Call-ID: msg-1\r\n\
              CSeq: 1 MESSAGE\r\n\
-             Content-Type: text/plain\r\n\
+             Content-Type: application/jose\r\n\
              Content-Length: {}\r\n\r\n{}",
             to,
             from,
@@ -515,6 +538,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plaintext_never_reaches_online_or_offline_delivery() {
+        let (svc, writers) = test_service();
+        let (tx, mut rx) = mpsc::channel(8);
+        let msg = build_message("1001", "1002", "hello");
+        let headers = msg
+            .split_once("\r\n\r\n")
+            .unwrap()
+            .0
+            .lines()
+            .filter(|line| {
+                !line.starts_with("Content-Length:") && !line.starts_with("Content-Type:")
+            })
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        let plaintext =
+            format!("{headers}\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello");
+        for online in [false, true] {
+            if online {
+                writers
+                    .write()
+                    .unwrap()
+                    .insert("1002".to_string(), tx.clone());
+            }
+            let response = svc.handle_message(&plaintext, "1001").await;
+            assert!(String::from_utf8(response)
+                .unwrap()
+                .contains("415 Unsupported Media Type"));
+            assert!(svc.offline_messages.read().unwrap().is_empty());
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
     async fn message_forwards_to_online_callee() {
         let (svc, writers) = test_service();
         let (tx, mut rx) = mpsc::channel(8);
@@ -529,7 +585,7 @@ mod tests {
         let forwarded = rx.try_recv().expect("在线被叫应直接收到消息");
         let fwd = String::from_utf8(forwarded).unwrap();
         assert!(fwd.starts_with("MESSAGE sip:1002@example.com"));
-        assert!(fwd.contains("hello online"));
+        assert!(fwd.contains(&super::super::e2ee::test_jwe("hello online")));
         assert!(fwd.contains("sip:1001@example.com"));
         // From 头重写为认证主叫（保留原 tag），Contact 指向服务
         assert!(fwd.contains("From: <sip:1001@example.com;transport=tls>;tag=caller-tag"));
@@ -545,16 +601,7 @@ mod tests {
         writers.write().unwrap().insert("1002".to_string(), tx);
 
         // 伪造 From 为 1999，认证主叫是 1001：转发时 From 必须被重写为 1001
-        let forged = format!(
-            "MESSAGE sip:1002@example.com SIP/2.0\r\n\
-             Via: SIP/2.0/TLS client.example.com;branch=z9hG4bKtest\r\n\
-             From: <sip:1999@example.com>;tag=caller-tag\r\n\
-             To: <sip:1002@example.com>\r\n\
-             Call-ID: msg-1\r\n\
-             CSeq: 1 MESSAGE\r\n\
-             Content-Type: text/plain\r\n\
-             Content-Length: 5\r\n\r\nforged"
-        );
+        let forged = build_message("1999", "1002", "forged");
         let resp = svc.handle_message(&forged, "1001").await;
         assert!(String::from_utf8(resp)
             .unwrap()
@@ -597,7 +644,7 @@ mod tests {
              To: <sip:1002@example.com>\r\n\
              Call-ID: msg-big\r\n\
              CSeq: 1 MESSAGE\r\n\
-             Content-Type: text/plain\r\n\
+             Content-Type: application/jose\r\n\
              X-Padding: {}\r\n\
              Content-Length: {}\r\n\r\n{}",
             "p".repeat(MAX_MESSAGE_REQUEST_LEN),
@@ -671,7 +718,7 @@ mod tests {
         let delivered = rx.try_recv().expect("上线后应收到补投消息");
         let text = String::from_utf8(delivered).unwrap();
         assert!(text.starts_with("MESSAGE sip:1002@"));
-        assert!(text.contains("hello offline"));
+        assert!(text.contains(&super::super::e2ee::test_jwe("hello offline")));
         assert!(text.contains("sip:1001@example.com"));
         // 补投时 From 重写为原始发送方（保留原 tag）
         assert!(text.contains("From: <sip:1001@example.com;transport=tls>;tag=caller-tag"));
@@ -695,7 +742,9 @@ mod tests {
         let map = svc.offline_messages.read().unwrap();
         let queue = map.get("1002").expect("发送失败的消息应保留在队列");
         assert_eq!(queue.len(), 1);
-        assert!(queue[0].original_request.contains("keep on failure"));
+        assert!(queue[0]
+            .original_request
+            .contains(&super::super::e2ee::test_jwe("keep on failure")));
     }
 
     #[tokio::test]
@@ -722,8 +771,16 @@ mod tests {
         let queue = map.get("1002").unwrap();
         assert_eq!(queue.len(), MAX_OFFLINE_MESSAGES);
         // 最旧的被丢弃，最新保留
-        assert!(queue.back().unwrap().original_request.contains("msg 109"));
-        assert!(!queue.front().unwrap().original_request.contains("msg 0"));
+        assert!(queue
+            .back()
+            .unwrap()
+            .original_request
+            .contains(&super::super::e2ee::test_jwe("msg 109")));
+        assert!(!queue
+            .front()
+            .unwrap()
+            .original_request
+            .contains(&super::super::e2ee::test_jwe("msg 0")));
     }
 
     /// 构造一条测试用的离线消息（TTL 判断不依赖 received_at，可传任意值）

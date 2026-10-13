@@ -20,6 +20,10 @@
 #   TAG       — 镜像标签                           (默认: latest)
 #   PUSH      — 是否推送到仓库 1=推送 0=仅构建      (默认: 1)
 #   BUILDER   — 构建后端 depot|buildx|auto        (默认: auto)
+#   指定版本时同时标记 latest；推送会更新远端两个标签。
+#   Buildx 的 PUSH=0 多平台模式只验证构建，不加载本地镜像。
+#   客户端接入、迁移和发布检查见 DEPLOYMENT.md。
+#
 #   PLATFORM  — 目标平台                           (默认: linux/amd64,linux/arm64)
 #
 # ============================================================
@@ -183,11 +187,11 @@ fi
 
 echo ""
 echo "  运行方式:"
-echo "   docker compose up -d"
-echo "   或:"
+echo "   docker compose up -d --build  # 使用源码构建 minghe:local"
+echo "   或运行上述标签（需要已推送或已加载到本地）:"
 echo "   docker run -d \\"
+echo "     --read-only --cap-drop ALL --security-opt no-new-privileges:true \\"
 echo "     -p 5061:5061/tcp \\"
-echo "     -p 20000-20020:20000-20020/udp \\"
 echo "     -v \$(pwd)/config:/app/config:ro \\"
 echo "     -v minghe-certs:/app/certs \\"
 echo "     ${IMAGE}:${TAG}"

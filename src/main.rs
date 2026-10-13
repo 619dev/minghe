@@ -1,8 +1,10 @@
 //! 鸣鹤 (MingHe) — 最小化安全 SIP 语音通信服务器
 //!
-//! 纯 TLS 信令 + SRTP 媒体加密的内部分机通信系统。
+//! TLS 信令路由；端点独立执行身份签名、DTLS-SRTP 和消息加密。
 
 mod config;
+// Legacy SRTP regression tests only; never compiled into the server.
+#[cfg(test)]
 mod media;
 mod sip;
 mod tls;
@@ -65,9 +67,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.extensions.range_end
     );
 
-    let media_addr = config.get_media_addr();
-    tracing::info!("媒体地址: {}", media_addr);
-
     let config = Arc::new(config);
 
     // 初始化 TLS
@@ -94,13 +93,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 启动注册清理后台任务
     registrar.start_cleanup_task();
 
-    // 创建媒体中继管理器
-    let media_manager = Arc::new(media::relay::MediaRelayManager::new(
-        config.media.rtp_port_start,
-        config.media.rtp_port_end,
-        media_addr,
-    ));
-
     tracing::info!(
         "鸣鹤 SIP 服务器正在启动于 {}:{}",
         config.server.listen_addr,
@@ -111,11 +103,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server_handle = {
         let config = Arc::clone(&config);
         let registrar = Arc::clone(&registrar);
-        let media_manager = Arc::clone(&media_manager);
         let tls_acceptor = tls_acceptor.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = sip::server::run(config, tls_acceptor, registrar, media_manager).await {
+            if let Err(e) = sip::server::run(config, tls_acceptor, registrar).await {
                 tracing::error!("SIP 服务器运行错误: {}", e);
             }
         })

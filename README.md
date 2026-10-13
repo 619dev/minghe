@@ -1,72 +1,45 @@
 # 鸣鹤 (MingHe)
 
-**最小化安全 SIP 语音通信服务器** — 纯 Rust 编写
+纯 Rust SIP/TLS 信令路由服务，面向需要客户端端到端加密的内部分机通信。
 
-[English](README_EN.md)
+[English](README_EN.md) · [端到端接入规范](E2EE.md) · [安全边界](SECURITY.md) · [部署与迁移](DEPLOYMENT.md)
 
----
+**当前源码已切换为强制端到端协议配置。服务端不生成媒体密钥、不解密语音、不接受明文消息。实际客户端仍需适配身份签名、DTLS-SRTP 和加密消息；旧版 SDES 客户端不能直接继续使用。此仓库没有完整软电话客户端。**
 
-## 特性
+## 功能
 
-- 🔒 **TLS 信令加密** — SIP over TLS (SIPS)，端口 5061，支持 TLS 1.2/1.3
-- 🎵 **SRTP 媒体加密** — AES_CM_128_HMAC_SHA1_80 / AEAD_AES_128_GCM (RFC 7714)，SDES 密钥交换
-- 🔑 **SIP Digest 认证** — MD5 `qop=auth`，nonce 有效期与重放检测，支持分机独立密码
-- 📡 **RTP 媒体中继** — 服务器解密并重新加密，仅从已认证的 SRTP 包学习地址
-- 💬 **分机即时消息** — SIP MESSAGE 互发文本，离线时暂存、上线后自动补投
-- 📱 **内部分机** — 1000–2000 号段（可配置），支持 INVITE/BYE/CANCEL/ACK
-- 🌐 **IP 证书** — 无需域名，支持 IP 地址直接签发 TLS 证书
-- 🔄 **证书自动续期** — 自签名证书到期前 30 天自动重新生成，热重载不中断服务
-- 🐳 **Docker 就绪** — 多架构镜像 (amd64/arm64)，一键 compose 部署
-- 🦀 **纯 Rust** — 异步高性能 (tokio)，内存安全，无 GC
+- SIP over TLS，默认 `5061/tcp`，客户端必须验证 TLS 证书。
+- SIP Digest SHA-256 `qop=auth`，nonce 绑定账号与连接、有效期及重放校验；拒绝 MD5 和缺省算法。
+- 音频 SDP 原样转发，强制 DTLS-SRTP、SHA-256 证书指纹、RTCP mux 和签名身份封装；拒绝明文及 SDES 降级。
+- SIP MESSAGE 只接受 JWE 密文，离线队列也只保留密文；转发及暂存移除 Digest 认证信息。
+- 客户端参考工具：RSA-OAEP-256 + AES-256-GCM 消息加密、Ed25519 身份签名、公钥指纹核对、持久重放检测及口令加密私钥。
+- 连接认证、会话归属、帧/队列大小、速率和超时限制，断连清理呼叫。
+- 自签名证书自动续期和 TLS 热重载、非 root Docker 部署。
+
+## 端到端的必要条件
+
+私钥在终端生成并保存，双方通过独立可信渠道核对公钥包指纹。每份 SDP 由终端签名，接收方先用固定的对方公钥验签，再核对实际 DTLS 证书指纹；消息接收方验证 AEAD、内层签名、接收身份、有效期及重放状态后才显示正文。
+
+服务器的登录认证及格式检查不能替代这些客户端验证。服务器仍能看到账号、地址、呼叫时间和密文长度，也能阻断通信。消息采用静态 RSA 公钥封装，尚无 Double Ratchet 前向保密、入侵后恢复或多设备管理。完整协议、工具命令和限制见 [E2EE.md](E2EE.md)。
 
 ## 快速开始
 
-### Docker / VPS 部署（推荐）
+先完成客户端适配和公钥指纹核对。服务器配置不包含用户端到端私钥或可信对方密钥。
 
 ```bash
-# 1. 准备配置
-mkdir -p config
-cp config.template.toml config/config.toml
-
-# 2. 编辑配置（修改 host、media_addr、default_password 及已启用的分机密码）
-vim config/config.toml
-
-# 3. 启动
-docker compose up -d
-
-# 4. 查看日志
-docker compose logs -f
-```
-
-> Docker Compose 默认使用命名卷保存自签名证书，不需要手动创建 `certs` 目录。
-
-> ⚠️ 本项目不再提供 Zeabur 模板。SIP 信令使用 TCP/TLS，但语音媒体使用 SRTP/UDP，必须保证配置中的 UDP 端口范围能以相同公网端口直达容器。只支持 HTTP/TCP 转发、随机外部端口或无法开放 UDP 端口范围的平台不适合直接部署本服务。
-
-### 从源码编译
-
-```bash
-# 环境要求：Rust 1.88+
-cargo build --release --locked
-
-# 准备本地配置（不要提交实际密码）
 mkdir -p config
 cp config.template.toml config/config.toml
 chmod 600 config/config.toml
-# 修改 host、media_addr 和所有启用的密码后运行
-./target/release/minghe -c config/config.toml
+# 修改 host、default_password 和启用的独立分机密码
 ```
 
-## 配置说明
-
-配置文件为 TOML 格式，详见 [`config.template.toml`](config.template.toml)。
-
-### 最小配置
+最小配置：
 
 ```toml
 [server]
 listen_addr = "0.0.0.0"
 sip_port = 5061
-host = "192.168.1.100"          # 你的服务器 IP 或域名
+host = "sip.example.com"
 
 [extensions]
 range_start = 1000
@@ -74,232 +47,64 @@ range_end = 2000
 default_password = "CHANGE_ME_TO_A_STRONG_PASSWORD"
 
 [tls]
-cert_path = ""                   # 留空 = 自动生成自签名证书
+cert_path = ""
 key_path = ""
 
-[media]
-rtp_port_start = 20000
-rtp_port_end = 20020
-media_addr = "192.168.1.100"     # 必填：客户端可访问的服务器媒体 IP
-```
-
-> 所有 `CHANGE_ME…` 值都必须替换为实际随机密码（至少 12 字节）。`media_addr` 必须填写客户端可访问的有效 IP；留空或填写域名会被启动校验拒绝。
-
-> 每通电话默认占用两个偶数 UDP 端口，例如第一通为 `20000/UDP` 和 `20002/UDP`。防火墙、云安全组、容器平台端口映射必须同时放行这些端口。
-
-> 默认 `20000-20020/udp` 支持约 5 通并发，适合小 VPS。需要更多并发时，同时扩大 `config.toml`、Docker 端口映射和防火墙/安全组范围。不要在小 VPS 上默认映射 `20000-30000/udp`，Docker 创建上万个 UDP 端口映射时可能卡死。
-
-### 部署平台要求
-
-| 项目 | 要求 |
-|:-----|:-----|
-| SIP 信令 | 固定公网 TCP 端口，默认 `5061/tcp` |
-| SRTP 媒体 | 固定公网 UDP 端口范围，默认 `20000-20020/udp` |
-| 端口映射 | 外部端口必须与 SDP 中公布的端口一致 |
-| 媒体地址 | `media_addr` 必须是客户端可访问的公网或内网 IP |
-
-如果部署平台无法开放固定 UDP 端口范围，常见现象是：分机能注册、能拨通、能接听，但双方没有声音。
-
-### 分机独立密码
-
-建议在 `[passwords]` 中为每个分机设置不同的随机密码。未列出的分机使用 `default_password`，知道共享密码的人可以登录所有使用该密码的分机。下面的占位值必须替换：
-
-```toml
 [passwords]
-1001 = "CHANGE_ME_EXTENSION_1001"
-1002 = "CHANGE_ME_EXTENSION_1002"
+# 1001 = "CHANGE_ME_EXTENSION_1001"
+# 1002 = "CHANGE_ME_EXTENSION_1002"
 ```
 
-### TLS 证书
+所有占位密码必须替换为至少 12 字节的随机密码。建议每个分机使用不同密码；共享默认密码允许其持有者登录所有使用该密码的分机。
 
-| 模式 | 配置 | 说明 |
-|:-----|:-----|:-----|
-| **自签名** | `cert_path = ""` | 自动生成，到期前 30 天自动续期，推荐内网使用 |
-| **IP 证书** | `host = "1.2.3.4"` | 自动识别 IP，生成 IP SAN 证书 |
-| **域名证书** | `host = "sip.example.com"` | 自动识别域名，生成 DNS SAN 证书 |
-| **外部证书** | `cert_path = "/path/to/cert.pem"` | 使用 Let's Encrypt 等外部证书 |
-
-## 安全与升级
-
-安全检查结果和完整限制见 [SECURITY.md](SECURITY.md)（[English](SECURITY_EN.md)）。
-
-- 客户端必须支持 Digest `qop=auth`，在同一 TLS 连接注册后才能发起呼叫或消息；nonce 过期会收到新的 401 挑战。
-- 注册最多有效 1 小时。每个连接只绑定一个账号，切换账号需重连；断连会清理相关呼叫。
-- 每个主叫最多发起 2 个并发呼叫；默认媒体端口池支持 5 通。未接通呼叫最多保留 120 秒，已接通呼叫最多 4 小时，后台每 30 秒清理。
-- 两端必须主动发送有效 SRTP 包，服务端才学习目标地址。只接收不发送的终端需要适配。
-- 单 IP 每分钟最多 60 次 REGISTER（含挑战和重试），单连接每分钟最多 300 条 SIP 消息。共用 NAT 出口的大量终端需评估这些限制。
-- 中继在服务端解密再加密，因此服务器属于信任边界；这不是端到端加密。
-
-本次源码更新不代表 Docker Hub 的 `latest` 镜像已同步发布。需要立即使用这些修复时，请从当前源码构建。
-
-## 客户端配置
-
-推荐客户端：
-
-- iOS / Android：Bria Mobile app
-- 桌面电话机：方位 Linkvil W610W / W620W
-
-其他客户端需支持 SIP over TLS、SDES-SRTP（`AES_CM_128_HMAC_SHA1_80` 或 `AEAD_AES_128_GCM`）以及可配置自签名证书验证策略。
-
-| 配置项 | 值 |
-|:------|:----|
-| 服务器地址 | 你的服务器 IP 或域名 |
-| 端口 | `5061` |
-| 传输协议 | **TLS** |
-| 用户名 | 分机号（如 `1001`） |
-| 密码 | 对应密码 |
-| 域/Realm | 与配置文件 `host` 一致 |
-
-> ⚠️ 使用自签名证书时，请将 `certs/server.crt` 导入客户端为受信任证书，并保持 TLS 证书验证开启。证书续期后需要更新信任；公网部署建议使用受信任 CA 签发的证书。
-
-## 即时消息的存储与投递
-
-消息体最多 4 KiB，完整 MESSAGE 请求最多 8 KiB。离线消息只保存在内存中，保留 24 小时；每个接收分机最多 100 条，满时淘汰最旧消息，全局最多 10000 条。每个发送方每分钟最多暂存 120 条、同时最多暂存 500 条。容量或速率超限返回 503；200 表示服务端已接收，不保证客户端已确认收取。上线及发送队列腾出空间时继续补投，服务重启会丢失尚未投递的消息。
-
-## 架构
-
-```
-┌──────────┐     SIP/TLS     ┌───────────────────────┐     SIP/TLS     ┌──────────┐
-│          │◄───────────────►│                       │◄───────────────►│          │
-│  分机     │    TCP:5061     │    鸣鹤 SIP Server     │    TCP:5061     │  分机     │
-│  1001    │                 │                       │                 │  1002    │
-│          │     SRTP        │  ┌─────────────────┐  │      SRTP       │          │
-│          │◄───────────────►│  │  Media Relay    │  │◄───────────────►│          │
-└──────────┘  UDP:20000+     │  │  RTP 媒体中继    │  │   UDP:20000+    └──────────┘
-                             │  └─────────────────┘  │
-                             │                       │
-                             │  ┌─────────────────┐  │
-                             │  │  Registrar      │  │
-                             │  │  注册 + Digest   │  │
-                             │  └─────────────────┘  │
-                             │                       │
-                             │  ┌─────────────────┐  │
-                             │  │  Router         │  │
-                             │  │  呼叫路由        │  │
-                             │  └─────────────────┘  │
-                             └───────────────────────┘
-```
-
-## 支持的 SIP 方法
-
-| 方法 | 说明 |
-|:-----|:-----|
-| `REGISTER` | 分机注册/注销，Digest 认证 |
-| `INVITE` | 发起语音通话，SDP 协商，SRTP 密钥分配 |
-| `ACK` | 确认通话建立 |
-| `BYE` | 结束通话，释放媒体资源 |
-| `CANCEL` | 取消未接通的呼叫 |
-| `OPTIONS` | 心跳保活 / 能力查询 |
-| `MESSAGE` | 分机间即时消息；离线时暂存，上线后自动补投 |
-
-## 项目结构
-
-```
-minghe/
-├── Cargo.toml                # 项目清单
-├── config.toml               # 示例配置（必须修改密码及媒体 IP）
-├── config.template.toml      # 配置模板（带详细注释）
-├── Dockerfile                # 多阶段构建
-├── docker-compose.yml        # 容器编排
-├── build-and-push.sh         # 多架构镜像构建脚本
-├── SECURITY.md / SECURITY_EN.md # 安全检查、限制与升级说明
-├── .env                      # 本地 Compose 环境变量（Git 忽略）
-└── src/
-    ├── main.rs               # 入口、CLI、优雅关闭
-    ├── config.rs             # 配置加载与验证
-    ├── tls.rs                # TLS 管理、证书自动续期、热重载
-    ├── sip/
-    │   ├── mod.rs
-    │   ├── server.rs         # TLS 监听、连接管理、消息路由
-    │   ├── parser.rs         # SIP 消息解析与构建
-    │   ├── registrar.rs      # Digest 认证、注册管理
-    │   ├── router.rs         # INVITE/ACK/BYE/CANCEL 路由
-    │   ├── message.rs        # 即时消息、离线队列和配额
-    │   └── transaction.rs    # 事务跟踪与超时清理
-    └── media/
-        ├── mod.rs
-        ├── srtp.rs           # RFC 3711 / RFC 7714 SRTP 实现（AES-CM / AES-GCM）
-        └── relay.rs          # UDP 媒体中继
-```
-
-## Docker
-
-### 使用预构建镜像
+源码运行（Rust 1.88+）：
 
 ```bash
-docker pull facilisvelox/minghe:latest
-
-# 如果使用宿主机目录挂载证书，请先确保容器内 minghe 用户可写。
-mkdir -p config certs
-sudo chown -R 10001:10001 certs
-
-docker run -d \
-  --name minghe-sip \
-  --read-only --cap-drop ALL --security-opt no-new-privileges=true \
-  -p 5061:5061/tcp \
-  -p 20000-20020:20000-20020/udp \
-  -v $(pwd)/config:/app/config:ro \
-  -v $(pwd)/certs:/app/certs \
-  facilisvelox/minghe:latest
-```
-
-### 从源码构建镜像
-
-```bash
-docker build -t minghe .
-```
-
-### 多架构构建与推送
-
-```bash
-# 安装 depot CLI 或 Docker Buildx；脚本优先选择 depot
-# 构建并推送 latest
-./build-and-push.sh
-
-# 构建指定版本
-TAG=v0.1.0 ./build-and-push.sh
-
-# 仅构建不推送
-PUSH=0 ./build-and-push.sh
-```
-
-## 开发
-
-```bash
-# 编译
-cargo build --locked
-
-# 测试
-cargo test --locked
-
-# 调试模式（详细日志）
-RUST_LOG=debug cargo run --locked -- -c config/config.toml
-
-# Release 构建
 cargo build --release --locked
+./target/release/minghe -c config/config.toml
 ```
 
-## 环境变量
+Docker 从当前源码构建：
 
-| 变量 | 默认值 | 说明 |
-|:-----|:------|:-----|
-| `RUST_LOG` | `info` | 日志级别：`error` / `warn` / `info` / `debug` / `trace` |
-| `SIP_PORT` | `5061` | SIP TLS 端口映射 |
-| `RTP_PORT_START` | `20000` | RTP 端口范围起始 |
-| `RTP_PORT_END` | `20020` | RTP 端口范围结束，默认约 5 通并发 |
-| `CPU_LIMIT` | `1.0` | Docker Compose CPU 限制；1 核 VPS 可直接使用，多核机器可调高 |
-| `MEM_LIMIT` | `512M` | Docker Compose 内存限制 |
-| `TZ` | `Asia/Shanghai` | 容器时区 |
+```bash
+docker compose up -d --build
+docker compose logs -f
+```
 
-这些变量仅用于 Compose 端口映射和运行环境，不会覆盖 TOML 配置。修改 SIP 或媒体端口时，必须同时修改配置、映射和防火墙规则；建议 SIP 内外端口保持一致。
+配置文件须可被容器 UID 10001 读取；宿主用户的 0600 文件在 Linux bind mount 中需要专门授权。端口变量、证书卷及发布注意事项见 [部署与迁移](DEPLOYMENT.md)。
 
+Compose 默认使用本地构建的 `minghe:local`，证书保存到命名卷。需要固定公网 TCP 信令端口。服务端不再监听 RTP UDP 端口，旧 `[media]` 配置仅为升级兼容读取，并发出停用提示。跨 NAT 的客户端必须配置 ICE/STUN，必要时配置独立的只转发密文的 TURN；本项目没有 TURN 服务。
+
+公网使用受信任 CA 的证书；使用自签名证书时将 `certs/server.crt` 导入客户端信任并保持证书验证开启，续期后更新信任。TLS 服务端证书不能替代对方终端身份核对。
+
+本次源码修改未发布 Docker Hub 镜像；旧 `latest` 镜像不能代表本次实现。
+
+## 方法与容量
+
+支持 REGISTER、INVITE、ACK、BYE、CANCEL、OPTIONS、MESSAGE。初始 INVITE 必须有签名 SDP；当前仅支持单个活动音频流及 RTCP mux。不支持 offerless、re-INVITE、视频或在 ACK 中协商媒体。
+
+每主叫最多 2 个呼叫，全局最多 256 个；未接通最多保留 120 秒，接通最多 4 小时。注册最多有效 1 小时；同一连接只绑定一个账号。
+
+MESSAGE body 最多 4 KiB，完整请求最多 8 KiB；离线密文在内存中保留 24 小时，每接收方最多 100 条，全局最多 10000 条。单发送方每分钟最多暂存 120 条、同时最多暂存 500 条。200 仅表示服务端接收，不表示客户端验签解密成功；服务重启会丢失尚未投递的消息。
+
+## 开发与验证
+
+```bash
+cargo test --locked
+cargo clippy --locked --all-targets
+cargo fmt --check
+# 在客户端参考工具的 Python 环境中
+python -m unittest discover -s tools -p 'test_e2ee_client.py' -v
+```
+
+核心代码：`src/sip/e2ee.rs`（准入策略）、`router.rs`（签名 SDP 路由）、`message.rs`（密文投递）、`registrar.rs`（注册认证），以及 `tools/e2ee_client.py`（终端参考加密）。旧媒体实现及 SDP 改写工具仅在历史回归测试中编译，生产二进制不包含解密中继。
+
+本机 TLS/SIP 集成测试已验证注册、离线密文补投、接收端解密和签名 SDP 路由。实际终端接入、跨 NAT 双向音频和容器运行仍需上线前验证；单元测试不等同于完整系统安全审计。
 
 如果这个项目对你有用的话，请我喝罐可乐吧。
-<br>
+
 <img width=30% height=30% src="请我喝可乐.jpg" alt="qrcode">
-<br>
+
 ## 许可证
 
-本项目采用 [Apache License 2.0](LICENSE) 开源许可协议。
-
-Copyright 2026 MingHe Contributors
+[Apache License 2.0](LICENSE)，Copyright 2026 MingHe Contributors。

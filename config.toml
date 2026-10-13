@@ -24,14 +24,9 @@ default_password = "CHANGE_ME_TO_A_STRONG_PASSWORD"
 cert_path = ""
 key_path = ""
 
-[media]
-# RTP 中继端口范围
-rtp_port_start = 20000
-rtp_port_end = 20020
-# 服务器公网/内网 IP（用于 SDP 中的媒体地址）
-# 不要留空。请替换为 Bria、Linkvil 等客户端能访问到的公网或内网 IP。
-# 启动时拒绝空值或无效 IP，不执行自动检测。
-media_addr = "CHANGE_ME_MEDIA_IP"
+# 媒体由客户端使用 ICE / DTLS-SRTP 建立，服务器不分配 UDP 端口。
+# 客户端必须支持 SHA-256 Digest、签名 SDP 和 JWE 消息；详见 E2EE.md。
+# 旧 [media] 配置已停用，不应继续配置媒体地址或 SDES 密钥。
 
 # 单独为分机设置密码（覆盖 default_password）
 # 格式：分机号 = "密码"

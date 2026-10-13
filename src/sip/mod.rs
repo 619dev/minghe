@@ -14,3 +14,5 @@ pub mod registrar;
 pub mod router;
 pub mod server;
 pub mod transaction;
+
+pub mod e2ee;

@@ -55,9 +55,6 @@ USER minghe
 # SIP TLS 端口
 EXPOSE 5061/tcp
 
-# RTP 媒体端口范围（默认约 5 通并发）
-EXPOSE 20000-20020/udp
-
 # 健康检查：检查进程是否存活
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD pgrep minghe > /dev/null || exit 1

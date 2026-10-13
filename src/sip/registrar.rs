@@ -3,7 +3,6 @@
 //! 管理分机的注册状态，实现 SIP Digest 认证。
 //! 支持 REGISTER 请求的完整处理流程：认证挑战 → 验证 → 注册/注销。
 
-use md5::{Digest, Md5};
 use rand::Rng;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -297,7 +296,7 @@ impl RegistrarService {
             (peer, extension.to_string(), Instant::now(), 0),
         );
         let header = format!(
-            "Digest realm=\"{}\", nonce=\"{}\", algorithm=MD5, qop=\"auth\"{}",
+            "Digest realm=\"{}\", nonce=\"{}\", algorithm=SHA-256, qop=\"auth\"{}",
             self.domain,
             nonce,
             if stale { ", stale=true" } else { "" }
@@ -441,13 +440,20 @@ fn parse_authorization(header_value: &str) -> Option<DigestParams> {
                 "qop" => qop = Some(val),
                 "nc" => nc = Some(val),
                 "cnonce" => cnonce = Some(val),
-                "algorithm" if !val.eq_ignore_ascii_case("MD5") => return None,
+                "algorithm" if !val.eq_ignore_ascii_case("SHA-256") => return None,
                 _ => {}
             }
         }
     }
 
-    if username.is_empty() || nonce.is_empty() || response.is_empty() {
+    if username.is_empty()
+        || realm.is_empty()
+        || nonce.is_empty()
+        || uri.is_empty()
+        || response.len() != 64
+        || !response.bytes().all(|b| b.is_ascii_hexdigit())
+        || !seen.contains("algorithm")
+    {
         return None;
     }
 
@@ -492,11 +498,11 @@ fn split_digest_params(input: &str) -> Vec<String> {
 
 /// 验证 Digest 认证响应
 ///
-/// 仅接受 qop=auth：response = MD5(HA1:nonce:nc:cnonce:qop:HA2)
+/// 仅接受 qop=auth：response = SHA-256(HA1:nonce:nc:cnonce:qop:HA2)
 ///
 /// ```text
-/// HA1 = MD5(username:realm:password)
-/// HA2 = MD5(method:uri)
+/// HA1 = SHA-256(username:realm:password)
+/// HA2 = SHA-256(method:uri)
 /// ```
 fn validate_digest(
     username: &str,
@@ -510,18 +516,21 @@ fn validate_digest(
     nc: Option<&str>,
     cnonce: Option<&str>,
 ) -> bool {
-    let ha1 = md5_hex(&format!("{}:{}:{}", username, realm, password));
-    let ha2 = md5_hex(&format!("{}:{}", method, uri));
+    let ha1 = sha256_hex(&format!("{}:{}:{}", username, realm, password));
+    let ha2 = sha256_hex(&format!("{}:{}", method, uri));
 
-    let expected = match qop {
-        Some("auth") => {
-            // RFC 2617 qop=auth: response = MD5(HA1:nonce:nc:cnonce:qop:HA2)
-            let nc = nc.unwrap_or("00000001");
-            let cnonce = cnonce.unwrap_or("");
-            md5_hex(&format!("{}:{}:{}:{}:auth:{}", ha1, nonce, nc, cnonce, ha2))
+    let (nc, cnonce) = match (qop, nc, cnonce) {
+        (Some("auth"), Some(nc), Some(cnonce))
+            if nc.len() == 8
+                && u32::from_str_radix(nc, 16).is_ok_and(|value| value > 0)
+                && !cnonce.is_empty() =>
+        {
+            (nc, cnonce)
         }
         _ => return false,
     };
+    // RFC 8760 / RFC 7616 qop=auth; missing replay fields never get defaults.
+    let expected = sha256_hex(&format!("{}:{}:{}:{}:auth:{}", ha1, nonce, nc, cnonce, ha2));
 
     use subtle::ConstantTimeEq;
     expected
@@ -530,12 +539,12 @@ fn validate_digest(
         .into()
 }
 
-/// 计算 MD5 哈希并返回小写十六进制字符串
-fn md5_hex(input: &str) -> String {
-    let mut hasher = Md5::new();
-    hasher.update(input.as_bytes());
-    let result = hasher.finalize();
-    hex::encode(result)
+/// 计算 SHA-256 哈希并返回小写十六进制字符串
+fn sha256_hex(input: &str) -> String {
+    hex::encode(ring::digest::digest(
+        &ring::digest::SHA256,
+        input.as_bytes(),
+    ))
 }
 
 #[cfg(test)]
@@ -547,10 +556,10 @@ mod tests {
     }
 
     fn authorized(nonce: &str, username: &str, ext: &str, nc: &str) -> String {
-        let ha1 = md5_hex(&format!("{username}:example.com:secret"));
-        let ha2 = md5_hex("REGISTER:sip:example.com");
-        let response = md5_hex(&format!("{ha1}:{nonce}:{nc}:client:auth:{ha2}"));
-        request(&format!("Authorization: Digest username=\"{username}\", realm=\"example.com\", nonce=\"{nonce}\", uri=\"sip:example.com\", response=\"{response}\", qop=auth, nc={nc}, cnonce=\"client\"\r\n"), ext)
+        let ha1 = sha256_hex(&format!("{username}:example.com:secret"));
+        let ha2 = sha256_hex("REGISTER:sip:example.com");
+        let response = sha256_hex(&format!("{ha1}:{nonce}:{nc}:client:auth:{ha2}"));
+        request(&format!("Authorization: Digest username=\"{username}\", realm=\"example.com\", nonce=\"{nonce}\", uri=\"sip:example.com\", response=\"{response}\", algorithm=SHA-256, qop=auth, nc={nc}, cnonce=\"client\"\r\n"), ext)
     }
 
     #[test]
@@ -617,23 +626,33 @@ mod tests {
             "Digest username=1001, nonce=n, response=r, algorithm=SHA-256"
         )
         .is_none());
+        let valid = format!("Digest username=1001, realm=example.com, uri=sip:example.com, nonce=n, response={}, algorithm=SHA-256", "a".repeat(64));
+        assert!(parse_authorization(&valid).is_some());
+        assert!(
+            parse_authorization(&valid.replace("algorithm=SHA-256", "algorithm=MD5")).is_none()
+        );
+        assert!(parse_authorization(&valid.replace(", algorithm=SHA-256", "")).is_none());
+        assert!(parse_authorization(&valid.replace(&"a".repeat(64), &"a".repeat(32))).is_none());
     }
 
     #[test]
-    fn test_md5_hex() {
-        // MD5("abc") = 900150983cd24fb0d6963f7d28e17f72
-        assert_eq!(md5_hex("abc"), "900150983cd24fb0d6963f7d28e17f72");
+    fn test_sha256_hex() {
+        // SHA-256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+        assert_eq!(
+            sha256_hex("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]
     fn test_digest_rejects_no_qop() {
         // RFC 2069（无 qop）:
-        // HA1 = MD5("1001:minghe.local:minghe@2024")
-        // HA2 = MD5("REGISTER:sip:minghe.local")
-        // expected = MD5(HA1:testnonce:HA2)
-        let ha1 = md5_hex("1001:minghe.local:minghe@2024");
-        let ha2 = md5_hex("REGISTER:sip:minghe.local");
-        let response = md5_hex(&format!("{}:testnonce:{}", ha1, ha2));
+        // HA1 = SHA-256("1001:minghe.local:minghe@2024")
+        // HA2 = SHA-256("REGISTER:sip:minghe.local")
+        // expected = SHA-256(HA1:testnonce:HA2)
+        let ha1 = sha256_hex("1001:minghe.local:minghe@2024");
+        let ha2 = sha256_hex("REGISTER:sip:minghe.local");
+        let response = sha256_hex(&format!("{}:testnonce:{}", ha1, ha2));
 
         assert!(!validate_digest(
             "1001",
@@ -652,10 +671,10 @@ mod tests {
     #[test]
     fn test_digest_validation_qop_auth() {
         // RFC 2617（qop=auth）:
-        // response = MD5(HA1:nonce:nc:cnonce:auth:HA2)
-        let ha1 = md5_hex("1001:minghe.local:minghe@2024");
-        let ha2 = md5_hex("REGISTER:sip:minghe.local");
-        let response = md5_hex(&format!(
+        // response = SHA-256(HA1:nonce:nc:cnonce:auth:HA2)
+        let ha1 = sha256_hex("1001:minghe.local:minghe@2024");
+        let ha2 = sha256_hex("REGISTER:sip:minghe.local");
+        let response = sha256_hex(&format!(
             "{}:testnonce:00000001:clientnonce:auth:{}",
             ha1, ha2
         ));
@@ -676,9 +695,12 @@ mod tests {
 
     #[test]
     fn test_digest_validation_wrong_password() {
-        let ha1 = md5_hex("1001:minghe.local:wrongpassword");
-        let ha2 = md5_hex("REGISTER:sip:minghe.local");
-        let response = md5_hex(&format!("{}:testnonce:{}", ha1, ha2));
+        let ha1 = sha256_hex("1001:minghe.local:wrongpassword");
+        let ha2 = sha256_hex("REGISTER:sip:minghe.local");
+        let response = sha256_hex(&format!(
+            "{}:testnonce:00000001:clientnonce:auth:{}",
+            ha1, ha2
+        ));
 
         assert!(!validate_digest(
             "1001",
@@ -688,21 +710,21 @@ mod tests {
             "sip:minghe.local",
             "REGISTER",
             &response,
-            None,
-            None,
-            None,
+            Some("auth"),
+            Some("00000001"),
+            Some("clientnonce"),
         ));
     }
 
     #[test]
     fn test_parse_authorization() {
-        let header = r#"Digest username="1001", realm="minghe.local", nonce="abc123", uri="sip:minghe.local", response="deadbeef""#;
+        let header = r#"Digest username="1001", realm="minghe.local", nonce="abc123", uri="sip:minghe.local", response="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", algorithm=SHA-256"#;
         let params = parse_authorization(header).unwrap();
         assert_eq!(params.username, "1001");
         assert_eq!(params.realm, "minghe.local");
         assert_eq!(params.nonce, "abc123");
         assert_eq!(params.uri, "sip:minghe.local");
-        assert_eq!(params.response, "deadbeef");
+        assert_eq!(params.response, "a".repeat(64));
     }
 
     #[test]

@@ -5,7 +5,7 @@
 # 使用方法:
 #   1. 复制配置模板:  cp config.template.toml config/config.toml
 #   2. 编辑配置文件:  vim config/config.toml
-#   3. 启动服务:      docker compose up -d
+#   3. 启动服务:      docker compose up -d --build
 #   4. 查看日志:      docker compose logs -f
 #   5. 停止服务:      docker compose down
 #
@@ -13,8 +13,9 @@
 
 services:
   minghe:
-    # 使用预构建镜像
-    image: facilisvelox/minghe:latest
+    # 从当前源码构建，避免误用仍采用 SDES 的旧 latest 镜像
+    build: .
+    image: minghe:local
 
     # 容器名称
     container_name: minghe-sip
@@ -31,10 +32,6 @@ services:
     ports:
       # SIP TLS 信令端口
       - "${SIP_PORT:-5061}:5061/tcp"
-      # RTP/SRTP 媒体端口范围（UDP）
-      # 外部端口必须与容器端口一致，因为 SDP 会直接公布这些端口。
-      # 默认 20000-20020 支持约 5 通并发；不要在小 VPS 上一次映射上万个 UDP 端口。
-      - "${RTP_PORT_START:-20000}-${RTP_PORT_END:-20020}:${RTP_PORT_START:-20000}-${RTP_PORT_END:-20020}/udp"
 
     # 卷挂载
     volumes:
@@ -49,10 +46,6 @@ services:
       - RUST_LOG=${RUST_LOG:-info}
       # 时区
       - TZ=${TZ:-Asia/Shanghai}
-
-    # 网络模式
-    # 如果需要使用宿主机网络（适用于 RTP 端口范围大的场景），取消注释:
-    # network_mode: host
 
     # 资源限制
     deploy:

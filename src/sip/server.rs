@@ -17,7 +17,6 @@ use super::registrar::RegistrarService;
 use super::router::Router;
 use super::transaction::TransactionManager;
 use crate::config::AppConfig;
-use crate::media::relay::MediaRelayManager;
 use crate::tls::ReloadableTlsAcceptor;
 
 /// 连接状态
@@ -111,14 +110,10 @@ pub async fn run(
     config: Arc<AppConfig>,
     tls_acceptor: ReloadableTlsAcceptor,
     registrar: Arc<RegistrarService>,
-    media_manager: Arc<MediaRelayManager>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let media_addr = config.get_media_addr();
     let router = Arc::new(Router::new(
         Arc::clone(&registrar),
-        Arc::clone(&media_manager),
         config.server.host.clone(),
-        media_addr,
         config.extensions.range_start,
         config.extensions.range_end,
     ));
@@ -378,6 +373,22 @@ async fn process_sip_message(
                 return;
             }
         }
+        // Offerless calls are unsupported; dialog control cannot carry a second
+        // unvalidated offer or accidentally forward SDES/plaintext content.
+        if matches!(method.as_str(), "ACK" | "BYE" | "CANCEL")
+            && parser::extract_body(msg_text).is_some()
+        {
+            if method != "ACK" {
+                let _ = writer_tx
+                    .send(parser::build_response(
+                        msg_text,
+                        415,
+                        "Unsupported Media Type",
+                    ))
+                    .await;
+            }
+            return;
+        }
         // One identity per connection prevents stale writer aliases after account switches.
         if method == "REGISTER" {
             let old = state
@@ -476,7 +487,7 @@ async fn process_sip_message(
                             "Allow",
                             "INVITE, ACK, BYE, CANCEL, REGISTER, OPTIONS, MESSAGE",
                         ),
-                        ("Accept", "application/sdp"),
+                        ("Accept", "application/sdp, application/jose"),
                     ],
                 );
                 let _ = writer_tx.send(response).await;
@@ -520,9 +531,7 @@ mod tests {
         ));
         let router = Arc::new(Router::new(
             registrar.clone(),
-            Arc::new(MediaRelayManager::new(20000, 20020, "127.0.0.1".into())),
             "example.com".into(),
-            "127.0.0.1".into(),
             1000,
             2000,
         ));
@@ -555,7 +564,15 @@ mod tests {
     }
 
     fn request(method: &str, from: &str, body: &str) -> String {
-        format!("{method} sip:1002@example.com SIP/2.0\r\nFrom: <sip:{from}@example.com>;tag=caller\r\nTo: <sip:1002@example.com>\r\nCall-ID: security-call\r\nCSeq: 1 {method}\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+        let identity = if method == "INVITE" && !body.is_empty() {
+            format!(
+                "X-Minghe-Identity: {}\r\n",
+                super::super::e2ee::test_identity(body, from, "1002", "security-call", "offer")
+            )
+        } else {
+            String::new()
+        };
+        format!("{method} sip:1002@example.com SIP/2.0\r\nFrom: <sip:{from}@example.com>;tag=caller\r\nTo: <sip:1002@example.com>\r\nCall-ID: security-call\r\nCSeq: 1 {method}\r\nContent-Type: application/sdp\r\n{identity}Content-Length: {}\r\n\r\n{body}", body.len())
     }
 
     #[tokio::test]
@@ -583,9 +600,9 @@ mod tests {
         let (caller, caller_tx, mut caller_rx) = connect(&state, "1001", 1234);
         let (callee, callee_tx, mut callee_rx) = connect(&state, "1002", 1235);
         let (attacker, attacker_tx, mut attacker_rx) = connect(&state, "1003", 1236);
-        let sdp = "v=0\r\nc=IN IP4 127.0.0.1\r\nm=audio 4000 RTP/SAVP 0\r\na=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n";
+        let sdp = super::super::e2ee::test_sdp("actpass");
         process_sip_message(
-            &request("INVITE", "1001", sdp),
+            &request("INVITE", "1001", &sdp),
             caller,
             caller_tx.clone(),
             &state,
@@ -641,5 +658,127 @@ mod tests {
         );
         state.registrar.unregister("1001");
         assert!(state.get_connection_extension(&new).is_none());
+    }
+
+    fn answer(status: u16, sdp: &str, signed_sdp: &str) -> String {
+        let identity = super::super::e2ee::test_identity(
+            signed_sdp,
+            "1002",
+            "1001",
+            "security-call",
+            "answer",
+        );
+        format!("SIP/2.0 {status} OK\r\nFrom: <sip:1001@example.com>;tag=caller\r\nTo: <sip:1002@example.com>;tag=callee\r\nContact: <sip:1002@example.com>\r\nCall-ID: security-call\r\nCSeq: 1 INVITE\r\nContent-Type: application/sdp\r\nX-Minghe-Identity: {identity}\r\nContent-Length: {}\r\n\r\n{sdp}", sdp.len())
+    }
+
+    #[tokio::test]
+    async fn e2ee_forwards_signed_offer_and_answer_without_changing_sdp() {
+        let state = fixture();
+        let (caller, caller_tx, mut caller_rx) = connect(&state, "1001", 1234);
+        let (callee, callee_tx, mut callee_rx) = connect(&state, "1002", 1235);
+        let offer = super::super::e2ee::test_sdp("actpass");
+        let invite = request("INVITE", "1001", &offer);
+        process_sip_message(&invite, caller, caller_tx.clone(), &state).await;
+        let forwarded = String::from_utf8(callee_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            parser::extract_body(&forwarded).as_deref(),
+            Some(offer.as_str())
+        );
+        assert_eq!(
+            parser::extract_header_value(&forwarded, "X-Minghe-Identity"),
+            parser::extract_header_value(&invite, "X-Minghe-Identity")
+        );
+        caller_rx.try_recv().unwrap();
+        let sdp = super::super::e2ee::test_sdp("active");
+        let response = answer(200, &sdp, &sdp);
+        process_sip_message(&response, callee, callee_tx, &state).await;
+        let forwarded = String::from_utf8(caller_rx.try_recv().unwrap()).unwrap();
+        assert!(forwarded.starts_with("SIP/2.0 200"));
+        assert_eq!(
+            parser::extract_body(&forwarded).as_deref(),
+            Some(sdp.as_str())
+        );
+        assert_eq!(
+            parser::extract_header_value(&forwarded, "X-Minghe-Identity"),
+            parser::extract_header_value(&response, "X-Minghe-Identity")
+        );
+        assert!(state.router.has_active_call("security-call"));
+        process_sip_message(&request("ACK", "1001", ""), caller, caller_tx, &state).await;
+        assert!(String::from_utf8(callee_rx.try_recv().unwrap())
+            .unwrap()
+            .starts_with("ACK "));
+    }
+
+    #[tokio::test]
+    async fn e2ee_rejects_unsigned_and_sdes_offers_before_forwarding() {
+        let state = fixture();
+        let (caller, caller_tx, mut caller_rx) = connect(&state, "1001", 1234);
+        let (_, _, mut callee_rx) = connect(&state, "1002", 1235);
+        let sdp = super::super::e2ee::test_sdp("actpass");
+        let signed = request("INVITE", "1001", &sdp);
+        let unsigned = signed
+            .lines()
+            .filter(|l| !l.starts_with("X-Minghe-Identity:"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        let sdes = request(
+            "INVITE",
+            "1001",
+            &sdp.replace("UDP/TLS/RTP/SAVPF", "RTP/SAVP"),
+        );
+        let changed = signed.replace("a=ice-ufrag:peer", "a=ice-ufrag:evil");
+        for invalid in [unsigned, sdes, changed] {
+            process_sip_message(&invalid, caller, caller_tx.clone(), &state).await;
+            assert!(String::from_utf8(caller_rx.try_recv().unwrap())
+                .unwrap()
+                .contains("488"));
+            assert!(callee_rx.try_recv().is_err());
+            assert!(!state.router.has_active_call("security-call"));
+        }
+    }
+
+    #[tokio::test]
+    async fn e2ee_rejects_early_and_final_downgrades_and_releases_peer() {
+        for status in [183, 200] {
+            let state = fixture();
+            let (caller, caller_tx, mut caller_rx) = connect(&state, "1001", 1234);
+            let (callee, callee_tx, mut callee_rx) = connect(&state, "1002", 1235);
+            let offer = super::super::e2ee::test_sdp("actpass");
+            process_sip_message(
+                &request("INVITE", "1001", &offer),
+                caller,
+                caller_tx,
+                &state,
+            )
+            .await;
+            let outbound = String::from_utf8(callee_rx.try_recv().unwrap()).unwrap();
+            caller_rx.try_recv().unwrap();
+            let sdp = super::super::e2ee::test_sdp("active");
+            let downgraded = sdp.replace("UDP/TLS/RTP/SAVPF", "RTP/AVP");
+            process_sip_message(
+                &answer(status, &downgraded, &downgraded),
+                callee,
+                callee_tx,
+                &state,
+            )
+            .await;
+            let rejected = String::from_utf8(caller_rx.try_recv().unwrap()).unwrap();
+            assert!(rejected.contains("488"));
+            assert!(parser::extract_body(&rejected).is_none());
+            assert!(!state.router.has_active_call("security-call"));
+            let control = String::from_utf8(callee_rx.try_recv().unwrap()).unwrap();
+            if status == 200 {
+                assert!(control.starts_with("ACK "));
+                let bye = String::from_utf8(callee_rx.try_recv().unwrap()).unwrap();
+                assert!(bye.starts_with("BYE "));
+                assert!(bye.contains("CSeq: 2 BYE"));
+            } else {
+                assert!(control.starts_with("CANCEL "));
+                assert_eq!(
+                    parser::extract_header_value(&control, "Via"),
+                    parser::extract_header_value(&outbound, "Via")
+                );
+            }
+        }
     }
 }
