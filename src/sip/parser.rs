@@ -702,7 +702,6 @@ pub fn extract_uri_from_header(msg: &str, header_name: &str) -> Option<String> {
 }
 
 /// 要注入 SDP 的 crypto 行描述（SDES）
-#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct SdpCrypto {
     /// crypto tag（同一媒体段内必须唯一）
@@ -713,7 +712,6 @@ pub struct SdpCrypto {
     pub key_b64: String,
 }
 
-#[cfg(test)]
 impl SdpCrypto {
     /// 生成 `a=crypto:TAG SUITE inline:KEY` 行
     pub fn to_line(&self) -> String {
@@ -729,7 +727,6 @@ impl SdpCrypto {
 /// 将 SDP 中的 c= 行替换为服务器中继地址，
 /// 将 m=audio 行的端口替换为中继端口，并将 RTP/AVP 规范化为 RTP/SAVP。
 /// 服务器作为媒体 B2BUA，每一侧使用独立的 SDES 密钥。
-#[cfg(test)]
 pub fn rewrite_sdp(sdp: &str, relay_addr: &str, relay_port: u16, crypto_key_b64: &str) -> String {
     rewrite_sdp_with_crypto(sdp, relay_addr, relay_port, Some(crypto_key_b64))
 }
@@ -737,7 +734,6 @@ pub fn rewrite_sdp(sdp: &str, relay_addr: &str, relay_port: u16, crypto_key_b64:
 /// 修改 SDP 中的媒体地址和端口，可选注入 SDES crypto key
 ///
 /// 单密钥版本：以 tag 1 + `AES_CM_128_HMAC_SHA1_80` 注入。
-#[cfg(test)]
 pub fn rewrite_sdp_with_crypto(
     sdp: &str,
     relay_addr: &str,
@@ -760,7 +756,6 @@ pub fn rewrite_sdp_with_crypto(
 ///
 /// 向 m=audio 段注入多个 `a=crypto` 行（不同 tag），供对端选择其支持的加密套件，
 /// 例如同时提供 `AES_CM_128_HMAC_SHA1_80` 与 `AEAD_AES_128_GCM`。
-#[cfg(test)]
 pub fn rewrite_sdp_with_cryptos(
     sdp: &str,
     relay_addr: &str,
@@ -834,14 +829,12 @@ pub fn rewrite_sdp_with_cryptos(
     sdp
 }
 
-#[cfg(test)]
 fn push_crypto_lines(result: &mut Vec<String>, cryptos: &[SdpCrypto]) {
     for crypto in cryptos {
         result.push(crypto.to_line());
     }
 }
 
-#[cfg(test)]
 fn should_strip_for_sdes_srtp(line: &str) -> bool {
     let lower = line.trim().to_ascii_lowercase();
     matches!(

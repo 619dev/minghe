@@ -51,9 +51,16 @@ default_password = "CHANGE_ME_TO_A_STRONG_PASSWORD"
 cert_path = ""
 key_path = ""
 
-# 媒体由客户端通过 ICE + DTLS-SRTP 建立；服务器不持有媒体密钥。
-# 跨 NAT 需要在客户端配置 STUN / 独立 TURN；本服务不提供 TURN。
-# 不支持 SDES-SRTP / 明文 RTP。详细客户端要求见 E2EE.md。
+# Bria 跨网络通话：取消下列注释启用 TLS + SDES-SRTP 中继。
+# media_addr 填双方可访问的服务器公网 IPv4，不能填 Docker IP。
+# 服务器终止媒体加密，该模式不是端到端加密；禁止明文 RTP。
+# 端口范围必须与 Docker UDP 映射及防火墙一致。
+# 保留旧版 [media] 配置即可恢复旧版媒体链路。
+# 没有 [media] 时使用 E2EE.md 中的端到端客户端协议。
+# [media]
+# rtp_port_start = 20000
+# rtp_port_end = 20020
+# media_addr = "203.0.113.10"
 
 # ============================================================
 # 分机独立密码（可选）

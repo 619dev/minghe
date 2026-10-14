@@ -14,6 +14,7 @@
 services:
   minghe:
     image: facilisvelox/minghe:latest
+    build: .
 
     # 容器名称
     container_name: minghe-sip
@@ -30,6 +31,8 @@ services:
     ports:
       # SIP TLS 信令端口
       - "${SIP_PORT:-5061}:5061/tcp"
+      # Bria SRTP 中继；必须与 [media] 的端口范围一致
+      - "20000-20020:20000-20020/udp"
 
     # 卷挂载
     volumes:

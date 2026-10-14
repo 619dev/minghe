@@ -1,4 +1,4 @@
-//! 历史媒体实现，仅在 cfg(test) 中编译以保留回归测试；生产服务器不使用。
+//! Bria 兼容模式的 SRTP 媒体实现。
 //!
 //! RTP/SRTP 媒体中继管理模块
 //!
@@ -133,7 +133,7 @@ impl MediaRelayManager {
 /// 为指定的呼叫建立两个 UDP socket，双向中继 SRTP 数据包。
 /// 采用"地址学习"机制：从首个收到的数据包中获取远端地址。
 ///
-/// 此历史实现要求 SRTP 密钥，解密并重加密；不用于当前生产服务。
+/// 此实现要求 SRTP 密钥，解密并重加密；仅在显式媒体兼容模式启用。
 pub async fn run_relay(
     call_id: &str,
     _media_addr: &str,

@@ -1,10 +1,8 @@
 //! 鸣鹤 (MingHe) — 最小化安全 SIP 语音通信服务器
 //!
-//! TLS 信令路由；端点独立执行身份签名、DTLS-SRTP 和消息加密。
+//! TLS 信令路由；默认端到端协议，可选 Bria SDES-SRTP 兼容中继。
 
 mod config;
-// Legacy SRTP regression tests only; never compiled into the server.
-#[cfg(test)]
 mod media;
 mod sip;
 mod tls;

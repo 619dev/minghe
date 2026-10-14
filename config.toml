@@ -24,9 +24,15 @@ default_password = "CHANGE_ME_TO_A_STRONG_PASSWORD"
 cert_path = ""
 key_path = ""
 
-# 媒体由客户端使用 ICE / DTLS-SRTP 建立，服务器不分配 UDP 端口。
-# 客户端必须支持 SHA-256 Digest、签名 SDP 和 JWE 消息；详见 E2EE.md。
-# 旧 [media] 配置已停用，不应继续配置媒体地址或 SDES 密钥。
+# 端到端模式由客户端使用 ICE / DTLS-SRTP 建立媒体；Bria 兼容模式分配 UDP 中继端口。
+# 两种模式均要求 SHA-256 Digest；MESSAGE 均要求 JWE。
+# 没有 [media] 时要求签名 SDP / DTLS-SRTP，详见 E2EE.md。
+# Bria 跨网络通话可在文件末尾启用以下兼容配置，详见 BRIA.md：
+# [media]
+# rtp_port_start = 20000
+# rtp_port_end = 20020
+# media_addr = "203.0.113.10"  # 替换为双方可达的服务器公网 IPv4
+# 兼容模式由服务器解密重加密语音，不是端到端加密。
 
 # 单独为分机设置密码（覆盖 default_password）
 # 格式：分机号 = "密码"

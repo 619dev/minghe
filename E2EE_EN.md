@@ -1,10 +1,12 @@
 # End-to-end encryption integration specification
 
+**Profile scope:** The E2EE guarantees below apply only without `[media]`. With `[media]`, the restored Bria SDES-SRTP relay holds media keys and decrypts/re-encrypts audio; it is not E2EE. SIP authentication, dialog ownership and JWE MESSAGE restrictions remain. See [BRIA_EN.md](BRIA_EN.md).
+
 [中文](E2EE.md) · [Security](SECURITY_EN.md) · [Deployment and migration](DEPLOYMENT_EN.md)
 
-MingHe routes signaling and encrypted messages. It does not exchange media keys or run a UDP decryption relay. SDES-SRTP, plaintext RTP and plaintext MESSAGE are rejected without a downgrade switch.
+This specification describes the default profile without `[media]`. In this profile, MingHe routes signaling and encrypted messages without exchanging media keys or running a UDP decryption relay; SDES-SRTP, plaintext RTP and plaintext MESSAGE are rejected. Bria compatibility is a separate startup profile, not an automatic downgrade.
 
-**This repository provides server admission rules and an endpoint cryptographic reference tool, not a complete softphone. Clients must implement identity verification, DTLS-SRTP and the message profile below. Updating the server alone does not adapt existing Bria or Linkvil configurations.**
+**This repository provides server admission rules and an endpoint cryptographic reference tool, not a complete softphone. Clients must implement identity verification, DTLS-SRTP and the message profile below. Updating the server alone does not give Bria or Linkvil this E2EE protocol. For Bria relay calls, follow [BRIA_EN.md](BRIA_EN.md) instead.**
 
 ## Identity and key trust
 
@@ -53,7 +55,7 @@ The server checks envelope structure, identities, direction, Call-ID, byte hash 
 
 Before sending media, compare the actual DTLS handshake certificate fingerprint against the verified SDP. Use modern DTLS with ephemeral key exchange, reject weak SRTP suites and plaintext fallback, and enable SRTP replay protection. Both signature verification and DTLS certificate binding are required.
 
-Endpoints handle ICE/STUN and, if necessary, an independent TURN service. TURN must forward encrypted DTLS/SRTP without terminating DTLS. MingHe supplies neither TURN nor media ports. Connectivity failure must fail the call rather than fall back to a decryption relay.
+Endpoints handle ICE/STUN and, if necessary, an independent TURN service. TURN must forward encrypted DTLS/SRTP without terminating DTLS. In this E2EE profile, MingHe supplies neither TURN nor media ports. Connectivity failure must fail the call rather than fall back to a decryption relay.
 
 Invalid early SDP yields 488 and cancellation of the callee INVITE transaction. Invalid 200 answers yield 488; where a valid callee dialog tag exists, the server sends ACK/BYE and releases the call. Endpoints still handle errors and timeouts themselves.
 
@@ -125,4 +127,4 @@ The server sees accounts, online status, IPs, SDP, timing and ciphertext sizes a
 
 The reference implementation is single-device, with no groups, device synchronization, automatic rotation/revocation, trusted key directory or encrypted backup. Protect persistent identity and replay state. SIP server certificate trust does not replace peer identity verification.
 
-Tests cover real encryption, tampering, identity replacement, expiration, persistent replay, SDP direction/Call-ID binding and loopback TLS/SIP transport. Actual softphone interoperability, cross-NAT connectivity and real audio remain unverified. Complete endpoint integration and independent security review before production use.
+E2EE tests cover real message encryption, tampering, identity replacement, expiration, persistent replay, SDP direction/Call-ID binding and loopback TLS/SIP transport. The separate Bria Rust regression verifies bidirectional local UDP SRTP; it does not verify E2EE ICE/DTLS audio. Actual softphone interoperability and cross-NAT media remain unverified. Complete endpoint integration and independent security review before production use.

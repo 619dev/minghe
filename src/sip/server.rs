@@ -111,12 +111,20 @@ pub async fn run(
     tls_acceptor: ReloadableTlsAcceptor,
     registrar: Arc<RegistrarService>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let router = Arc::new(Router::new(
+    let mut router = Router::new(
         Arc::clone(&registrar),
         config.server.host.clone(),
         config.extensions.range_start,
         config.extensions.range_end,
-    ));
+    );
+    if let Some(media) = &config.media {
+        router = router.with_media(
+            media,
+            config.extensions.range_start,
+            config.extensions.range_end,
+        );
+    }
+    let router = Arc::new(router);
 
     let transaction_mgr = Arc::new(TransactionManager::new());
     transaction_mgr.start_cleanup_task();
@@ -519,6 +527,153 @@ async fn process_sip_message(
 mod tests {
     use super::super::registrar::Registration;
     use super::*;
+
+    #[tokio::test]
+    async fn bria_profile_routes_call_and_relays_bidirectional_encrypted_audio() {
+        use crate::media::srtp::{SrtpCryptoSuite, SrtpSuite};
+        use tokio::net::UdpSocket;
+        use tokio::time::{timeout, Duration};
+        // Reserve an available pair temporarily so concurrent tests use distinct ports.
+        let (port, a, b) = {
+            let mut pair = None;
+            for p in (30000..60000).step_by(4) {
+                if let (Ok(a), Ok(b)) = (
+                    UdpSocket::bind(("0.0.0.0", p)).await,
+                    UdpSocket::bind(("0.0.0.0", p + 2)).await,
+                ) {
+                    pair = Some((p, a, b));
+                    break;
+                }
+            }
+            pair.expect("available relay ports")
+        };
+        let mut state = fixture();
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.router = Arc::new(
+            Router::new(inner.registrar.clone(), "example.com".into(), 1000, 2000).with_media(
+                &crate::config::MediaConfig {
+                    rtp_port_start: port,
+                    rtp_port_end: port + 4,
+                    media_addr: "127.0.0.1".into(),
+                },
+                1000,
+                2000,
+            ),
+        );
+        let (caller, caller_tx, mut caller_rx) = connect(&state, "1001", 15001);
+        let (callee, callee_tx, mut callee_rx) = connect(&state, "1002", 15002);
+        let mut caller_crypto = SrtpCryptoSuite::new();
+        let mut callee_crypto = SrtpCryptoSuite::new_with_suite(SrtpSuite::AeadAes128Gcm);
+        let offer = format!("v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\ns=-\r\nc=IN IP4 10.0.0.1\r\nt=0 0\r\nm=audio 4000 RTP/SAVP 0\r\na=crypto:7 AES_CM_128_HMAC_SHA1_80 inline:{}\r\n", caller_crypto.to_sdes_key());
+        // A signed E2EE offer must not silently enter the key-terminating relay.
+        process_sip_message(
+            &request("INVITE", "1001", &offer),
+            caller,
+            caller_tx.clone(),
+            &state,
+        )
+        .await;
+        assert_eq!(
+            parser::extract_status_code(
+                std::str::from_utf8(&caller_rx.recv().await.unwrap()).unwrap()
+            ),
+            Some(488)
+        );
+        assert!(callee_rx.try_recv().is_err());
+        let invite = request("INVITE", "1001", &offer)
+            .lines()
+            .filter(|l| !l.starts_with("X-Minghe-Identity:"))
+            .collect::<Vec<_>>()
+            .join("\r\n")
+            + "\r\n";
+        process_sip_message(&invite, caller, caller_tx.clone(), &state).await;
+        assert_eq!(
+            parser::extract_status_code(
+                std::str::from_utf8(&caller_rx.recv().await.unwrap()).unwrap()
+            ),
+            Some(100)
+        );
+        let outgoing = String::from_utf8(callee_rx.recv().await.unwrap()).unwrap();
+        let body = parser::extract_body(&outgoing).unwrap();
+        assert!(body.contains(&format!("m=audio {} RTP/SAVP", port + 2)));
+        assert!(!body.contains("c=IN IP4 10.0.0.1"));
+        let key = body.lines().find(|l| l.starts_with("a=crypto:2 ")).unwrap();
+        let (_, suite, key) = crate::media::srtp::parse_crypto_attribute(key).unwrap();
+        let mut callee_receive =
+            SrtpCryptoSuite::from_sdes_with_suite(SrtpSuite::from_sdp_name(&suite).unwrap(), &key)
+                .unwrap();
+        let answer = format!("v=0\r\no=- 1 1 IN IP4 10.1.0.1\r\ns=-\r\nc=IN IP4 10.1.0.1\r\nt=0 0\r\nm=audio 5000 RTP/SAVP 0\r\na=crypto:2 AEAD_AES_128_GCM inline:{}\r\n", callee_crypto.to_sdes_key());
+        let response = format!("SIP/2.0 200 OK\r\nFrom: <sip:1001@example.com>;tag=caller\r\nTo: <sip:1002@example.com>;tag=callee\r\nContact: <sip:1002@example.com>\r\nCall-ID: security-call\r\nCSeq: 1 INVITE\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{}", answer.len(), answer);
+        drop((a, b));
+        process_sip_message(&response, callee, callee_tx, &state).await;
+        let response = String::from_utf8(caller_rx.recv().await.unwrap()).unwrap();
+        let body = parser::extract_body(&response).unwrap();
+        assert!(body.contains(&format!("m=audio {} RTP/SAVP", port)));
+        let key = body.lines().find(|l| l.starts_with("a=crypto:7 ")).unwrap();
+        let (_, _, key) = crate::media::srtp::parse_crypto_attribute(key).unwrap();
+        let mut caller_receive = SrtpCryptoSuite::from_sdes(&key).unwrap();
+        process_sip_message(
+            &request("ACK", "1001", ""),
+            caller,
+            caller_tx.clone(),
+            &state,
+        )
+        .await;
+        assert!(String::from_utf8(callee_rx.recv().await.unwrap())
+            .unwrap()
+            .starts_with("ACK "));
+        let caller_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let callee_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut got_caller = false;
+        let mut got_callee = false;
+        timeout(Duration::from_secs(3), async {
+            for seq in 1u16.. {
+                let mut packet = vec![0x80, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1];
+                packet[2..4].copy_from_slice(&seq.to_be_bytes());
+                packet.extend_from_slice(b"audio-frame");
+                caller_udp
+                    .send_to(
+                        &caller_crypto.protect_rtp(&packet).unwrap(),
+                        ("127.0.0.1", port),
+                    )
+                    .await
+                    .unwrap();
+                callee_udp
+                    .send_to(
+                        &callee_crypto.protect_rtp(&packet).unwrap(),
+                        ("127.0.0.1", port + 2),
+                    )
+                    .await
+                    .unwrap();
+                let mut buffer = [0; 2048];
+                if let Ok(Ok((n, _))) =
+                    timeout(Duration::from_millis(20), caller_udp.recv_from(&mut buffer)).await
+                {
+                    assert_eq!(
+                        &caller_receive.unprotect_rtp(&buffer[..n]).unwrap()[12..],
+                        b"audio-frame"
+                    );
+                    got_caller = true;
+                }
+                if let Ok(Ok((n, _))) =
+                    timeout(Duration::from_millis(20), callee_udp.recv_from(&mut buffer)).await
+                {
+                    assert_eq!(
+                        &callee_receive.unprotect_rtp(&buffer[..n]).unwrap()[12..],
+                        b"audio-frame"
+                    );
+                    got_callee = true;
+                }
+                if got_caller && got_callee {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("both directions must carry decryptable audio");
+        process_sip_message(&request("BYE", "1001", ""), caller, caller_tx, &state).await;
+        assert!(!state.router.has_active_call("security-call"));
+    }
 
     fn fixture() -> Arc<ServerState> {
         let config: AppConfig = toml::from_str(include_str!("../../config.template.toml")).unwrap();

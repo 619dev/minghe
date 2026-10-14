@@ -16,3 +16,5 @@ pub mod server;
 pub mod transaction;
 
 pub mod e2ee;
+
+mod sdes_router;

@@ -39,8 +39,7 @@ clap = { version = "4", features = ["derive"] }
 # Utilities
 uuid = { version = "1", features = ["v4"] }
 
-# Historical SRTP regression tests only; no server media crypto is compiled.
-[dev-dependencies]
+# SRTP compatibility relay
 aes = "0.8"
 hmac = "0.12"
 sha1 = "0.10"

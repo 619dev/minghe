@@ -187,11 +187,11 @@ fi
 
 echo ""
 echo "  运行方式:"
-echo "   docker compose up -d --build  # 使用源码构建 minghe:local"
+echo "   docker compose up -d --build  # 使用当前源码构建配置的镜像"
 echo "   或运行上述标签（需要已推送或已加载到本地）:"
 echo "   docker run -d \\"
 echo "     --read-only --cap-drop ALL --security-opt no-new-privileges:true \\"
-echo "     -p 5061:5061/tcp \\"
+echo "     -p 5061:5061/tcp -p 20000-20020:20000-20020/udp \\"
 echo "     -v \$(pwd)/config:/app/config:ro \\"
 echo "     -v minghe-certs:/app/certs \\"
 echo "     ${IMAGE}:${TAG}"

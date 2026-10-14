@@ -1,6 +1,6 @@
 //! 配置模块
 //!
-//! 从 config.toml 加载服务器配置，包括 SIP 服务、分机范围和 TLS 证书；旧媒体配置仅为迁移读取并忽略。
+//! 从 config.toml 加载服务器配置，包括 SIP 服务、分机范围和 TLS 证书；可选 Bria SRTP 媒体中继配置。
 
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -14,9 +14,9 @@ pub struct AppConfig {
     pub extensions: ExtensionConfig,
     /// TLS 证书配置
     pub tls: TlsConfig,
-    /// 旧版本媒体中继配置，仅为升级兼容保留，永不启用。
+    /// 显式启用 Bria 兼容媒体中继；不设置时使用端到端协议。
     #[serde(default)]
-    pub media: Option<toml::Value>,
+    pub media: Option<MediaConfig>,
     /// 分机独立密码（可选，覆盖 default_password）
     #[serde(default)]
     pub passwords: HashMap<String, String>,
@@ -60,6 +60,15 @@ pub struct TlsConfig {
     pub cert_path: String,
     /// 私钥文件路径（留空则自动生成自签名证书）
     pub key_path: String,
+}
+
+/// TLS + SDES-SRTP compatibility profile; the server terminates media encryption.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaConfig {
+    pub rtp_port_start: u16,
+    pub rtp_port_end: u16,
+    pub media_addr: String,
 }
 
 impl AppConfig {
@@ -114,8 +123,21 @@ impl AppConfig {
             .into());
         }
 
-        if config.media.is_some() {
-            tracing::warn!("[media] 已停用：端到端模式不分配服务器媒体端口；请从配置删除旧媒体节");
+        if let Some(media) = &config.media {
+            if media.rtp_port_start == 0
+                || media.rtp_port_start % 2 != 0
+                || media.rtp_port_end.saturating_sub(media.rtp_port_start) < 4
+            {
+                return Err("媒体端口范围至少需要两个非零偶数 RTP 端口".into());
+            }
+            let ip = media
+                .media_addr
+                .parse::<std::net::Ipv4Addr>()
+                .map_err(|_| "media_addr 必须是客户端可访问的服务器 IPv4 地址")?;
+            if ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast() {
+                return Err("media_addr 必须是客户端可访问的服务器 IPv4 地址".into());
+            }
+            tracing::warn!("已启用 Bria 兼容 SRTP 中继：服务器终止媒体加密，此模式不是端到端加密");
         }
 
         // 校验独立密码中的分机号是否在范围内
@@ -169,10 +191,10 @@ mod tests {
             std::env::temp_dir().join(format!("minghe-config-{}.toml", uuid::Uuid::new_v4()));
         std::fs::write(&path, &valid).unwrap();
         assert!(AppConfig::load(path.to_str().unwrap()).is_ok());
-        // Media configuration is optional; legacy values never start a relay.
+        // Media configuration explicitly selects compatibility mode.
         std::fs::write(
             &path,
-            format!("{valid}\n[media]\nmedia_addr = ''\nrtp_port_start = 0\n"),
+            format!("{valid}\n[media]\nmedia_addr = '203.0.113.10'\nrtp_port_start = 20000\nrtp_port_end = 20010\n"),
         )
         .unwrap();
         assert!(AppConfig::load(path.to_str().unwrap()).is_ok());
@@ -183,6 +205,16 @@ mod tests {
             valid.replace("range_end = 2000", "range_end = 999"),
         ] {
             std::fs::write(&path, bad).unwrap();
+            assert!(AppConfig::load(path.to_str().unwrap()).is_err());
+        }
+        for media in [
+            "media_addr = '0.0.0.0'\nrtp_port_start = 20000\nrtp_port_end = 20020",
+            "media_addr = '203.0.113.10'\nrtp_port_start = 20001\nrtp_port_end = 20020",
+            "media_addr = '203.0.113.10'\nrtp_port_start = 0\nrtp_port_end = 20020",
+            "media_addr = '203.0.113.10'\nrtp_port_start = 20000\nrtp_port_end = 20002",
+            "media_addr = 'sip.example.com'\nrtp_port_start = 20000\nrtp_port_end = 20020",
+        ] {
+            std::fs::write(&path, format!("{valid}\n[media]\n{media}\n")).unwrap();
             assert!(AppConfig::load(path.to_str().unwrap()).is_err());
         }
         std::fs::write(&path, "password = 'DO_NOT_LOG_THIS_SECRET'\nINVALID").unwrap();

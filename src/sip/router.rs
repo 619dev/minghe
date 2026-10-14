@@ -1,7 +1,7 @@
 //! 呼叫路由模块
 //!
 //! 处理 INVITE、ACK、BYE、CANCEL 等呼叫相关的 SIP 请求。
-//! 作为 B2BUA（Back-to-Back User Agent）工作，管理呼叫信令与会话归属，原样转发签名 SDP，不处理媒体或媒体密钥。
+//! 作为 B2BUA（Back-to-Back User Agent）工作，管理呼叫信令与会话归属，默认原样转发签名 SDP；显式 [media] 模式委托给 Bria 兼容中继。
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -61,6 +61,7 @@ pub struct CallInfo {
 pub struct Router {
     /// 活跃呼叫 (Call-ID -> CallInfo)
     active_calls: RwLock<HashMap<String, CallInfo>>,
+    sdes: Option<super::sdes_router::SdesRouter>,
     /// 注册服务引用
     registrar: Arc<RegistrarService>,
     /// 服务器域名
@@ -90,11 +91,35 @@ impl Router {
         );
         Self {
             active_calls: RwLock::new(HashMap::new()),
+            sdes: None,
             registrar,
             domain,
             connection_writers,
             message_service,
         }
+    }
+
+    /// Explicit compatibility profile: TLS signaling and server-terminated SRTP.
+    pub fn with_media(
+        mut self,
+        media: &crate::config::MediaConfig,
+        range_start: u32,
+        range_end: u32,
+    ) -> Self {
+        let manager = Arc::new(crate::media::relay::MediaRelayManager::new(
+            media.rtp_port_start,
+            media.rtp_port_end,
+            media.media_addr.clone(),
+        ));
+        self.sdes = Some(super::sdes_router::SdesRouter::new(
+            self.registrar.clone(),
+            manager,
+            self.domain.clone(),
+            media.media_addr.clone(),
+            range_start,
+            range_end,
+        ));
+        self
     }
 
     /// Bind dialog actions to the exact TLS channel that established the call.
@@ -104,6 +129,10 @@ impl Router {
         writer: &mpsc::Sender<Vec<u8>>,
         method: &str,
     ) -> bool {
+        if let Some(router) = &self.sdes {
+            return router.authorizes_dialog(text, writer, method);
+        }
+
         let Some(id) = parser::extract_call_id(text) else {
             return false;
         };
@@ -130,6 +159,11 @@ impl Router {
     }
 
     pub fn cleanup_disconnected(&self, writer: &mpsc::Sender<Vec<u8>>) {
+        if let Some(router) = &self.sdes {
+            router.cleanup_disconnected(writer);
+            return;
+        }
+
         let ids: Vec<_> = self
             .active_calls
             .read()
@@ -149,6 +183,11 @@ impl Router {
     }
 
     pub fn cleanup_expired_calls(&self) {
+        if let Some(router) = &self.sdes {
+            router.cleanup_expired_calls();
+            return;
+        }
+
         let ids: Vec<_> = self
             .active_calls
             .read()
@@ -171,6 +210,11 @@ impl Router {
 
     /// 注册分机的写入通道（由 server 模块在注册成功后调用）
     pub fn register_writer(&self, extension: &str, writer: mpsc::Sender<Vec<u8>>) {
+        if let Some(router) = &self.sdes {
+            router.register_writer(extension, writer);
+            return;
+        }
+
         let mut writers = self.connection_writers.write().unwrap();
         writers.insert(extension.to_string(), writer);
         tracing::debug!("已注册分机 {} 的写入通道", extension);
@@ -178,6 +222,11 @@ impl Router {
 
     /// 注销分机的写入通道
     pub fn unregister_writer(&self, extension: &str) {
+        if let Some(router) = &self.sdes {
+            router.unregister_writer(extension);
+            return;
+        }
+
         let mut writers = self.connection_writers.write().unwrap();
         writers.remove(extension);
         tracing::debug!("已注销分机 {} 的写入通道", extension);
@@ -191,6 +240,10 @@ impl Router {
 
     /// 处理 MESSAGE 请求（委托给 MessageService，实现在 message 模块）
     pub async fn handle_message(&self, request_text: &str, from_ext: &str) -> Vec<u8> {
+        if let Some(router) = &self.sdes {
+            return router.handle_message(request_text, from_ext).await;
+        }
+
         self.message_service
             .handle_message(request_text, from_ext)
             .await
@@ -198,6 +251,11 @@ impl Router {
 
     /// 补投分机的离线即时消息（委托给 MessageService，实现在 message 模块）
     pub async fn deliver_offline_messages(&self, extension: &str) {
+        if let Some(router) = &self.sdes {
+            router.deliver_offline_messages(extension).await;
+            return;
+        }
+
         self.message_service
             .deliver_offline_messages(extension)
             .await
@@ -217,6 +275,10 @@ impl Router {
         request_text: &str,
         caller_writer: mpsc::Sender<Vec<u8>>,
     ) -> Vec<u8> {
+        if let Some(router) = &self.sdes {
+            return router.handle_invite(request_text, caller_writer).await;
+        }
+
         // 提取主叫分机号
         let caller_ext = parser::extract_uri_from_header(request_text, "From")
             .and_then(|uri| parser::extract_extension(&uri))
@@ -372,6 +434,11 @@ impl Router {
     /// 被叫的响应中包含被叫的 Via 头部，不能直接转发给主叫，
     /// 否则主叫会因 Via 不匹配而忽略响应。
     pub async fn handle_callee_response(&self, response_text: &str) {
+        if let Some(router) = &self.sdes {
+            router.handle_callee_response(response_text).await;
+            return;
+        }
+
         let call_id = match parser::extract_call_id(response_text) {
             Some(id) => id,
             None => return,
@@ -476,6 +543,11 @@ impl Router {
 
     /// 处理 ACK 请求
     pub async fn handle_ack(&self, request_text: &str) {
+        if let Some(router) = &self.sdes {
+            router.handle_ack(request_text).await;
+            return;
+        }
+
         let call_id = match parser::extract_call_id(request_text) {
             Some(id) => id,
             None => return,
@@ -510,6 +582,10 @@ impl Router {
 
     /// 处理 BYE 请求
     pub async fn handle_bye(&self, request_text: &str, from_extension: &str) -> Vec<u8> {
+        if let Some(router) = &self.sdes {
+            return router.handle_bye(request_text, from_extension).await;
+        }
+
         let call_id = match parser::extract_call_id(request_text) {
             Some(id) => id,
             None => {
@@ -590,6 +666,10 @@ impl Router {
 
     /// 处理 CANCEL 请求
     pub async fn handle_cancel(&self, request_text: &str) -> Vec<u8> {
+        if let Some(router) = &self.sdes {
+            return router.handle_cancel(request_text).await;
+        }
+
         let call_id = match parser::extract_call_id(request_text) {
             Some(id) => id,
             None => {
@@ -654,6 +734,10 @@ impl Router {
 
     /// 根据 Call-ID 查找呼叫中对端的分机号
     pub fn find_peer_extension(&self, call_id: &str, from_ext: &str) -> Option<String> {
+        if let Some(router) = &self.sdes {
+            return router.find_peer_extension(call_id, from_ext);
+        }
+
         let calls = self.active_calls.read().unwrap();
         if let Some(call) = calls.get(call_id) {
             if call.caller_ext == from_ext {
@@ -668,6 +752,10 @@ impl Router {
 
     /// 检查是否有匹配的活跃呼叫
     pub fn has_active_call(&self, call_id: &str) -> bool {
+        if let Some(router) = &self.sdes {
+            return router.has_active_call(call_id);
+        }
+
         let calls = self.active_calls.read().unwrap();
         calls.contains_key(call_id)
     }
@@ -681,12 +769,12 @@ impl Router {
     }
 }
 
-fn is_sdp(text: &str) -> bool {
+pub(super) fn is_sdp(text: &str) -> bool {
     parser::extract_header_value(text, "Content-Type")
         .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/sdp"))
 }
 
-fn cancel_outbound_invite(invite: &str) -> Option<Vec<u8>> {
+pub(super) fn cancel_outbound_invite(invite: &str) -> Option<Vec<u8>> {
     let uri = parser::extract_request_uri(invite)?;
     let cseq = parser::extract_header_value(invite, "CSeq")?;
     let number = cseq.split_whitespace().next()?;
@@ -701,7 +789,7 @@ fn cancel_outbound_invite(invite: &str) -> Option<Vec<u8>> {
     Some(request.into_bytes())
 }
 
-fn rejected_dialog_request(
+pub(super) fn rejected_dialog_request(
     invite: &str,
     answer: &str,
     method: &str,
@@ -734,7 +822,7 @@ fn rejected_dialog_request(
     Some(request.into_bytes())
 }
 
-fn build_outbound_request_bytes(
+pub(super) fn build_outbound_request_bytes(
     request: &[u8],
     target_uri: &str,
     domain: &str,
@@ -845,7 +933,7 @@ pub(crate) fn build_outbound_request_with_from(
     result
 }
 
-fn build_forwarded_invite_response(
+pub(super) fn build_forwarded_invite_response(
     original_invite: &str,
     callee_response: &str,
     status_code: u16,
@@ -956,7 +1044,7 @@ fn first_header_line(msg: &str, name: &str, compact: Option<&str>) -> Option<Str
     header_lines(msg, name, compact).into_iter().next()
 }
 
-fn reason_phrase(response: &str) -> &str {
+pub(super) fn reason_phrase(response: &str) -> &str {
     response
         .lines()
         .next()
