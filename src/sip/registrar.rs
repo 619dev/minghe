@@ -290,6 +290,9 @@ impl RegistrarService {
         if challenges.len() >= 4096 {
             return parser::build_response(request, 503, "Service Unavailable");
         }
+        tracing::info!(peer = %peer,
+            reason = if stale { "unknown or expired nonce" } else { "Authorization header absent" },
+            algorithm = "SHA-256", qop = "auth", "REGISTER 401 认证挑战原因");
         let nonce = generate_nonce();
         challenges.insert(
             nonce.clone(),
@@ -468,7 +471,12 @@ fn parse_authorization_checked(header_value: &str) -> Result<DigestParams, &'sta
         return Err("missing required Digest identity/challenge parameter");
     }
     if response.len() != 64 || !response.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("invalid Digest response format; SHA-256 requires 64 hex digits");
+        return Err(match response.len() {
+            0 => "empty Digest response; SHA-256 requires 64 hex digits",
+            32 => "32-character Digest response; SHA-256 requires 64 hex digits",
+            64 => "non-hex Digest response; SHA-256 requires hex encoding",
+            _ => "invalid Digest response length; SHA-256 requires 64 hex digits",
+        });
     }
 
     Ok(DigestParams {
