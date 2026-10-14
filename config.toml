@@ -1,6 +1,9 @@
 # 鸣鹤 (MingHe) 服务器配置
 
 [server]
+# Bria Mobile 兼容登录；恢复默认安全认证时改为 "sha256"。
+# 仍强制 TLS 和 qop=auth，不改变媒体加密模式。
+digest_algorithm = "md5"
 # 监听地址
 listen_addr = "0.0.0.0"
 # SIP TLS 端口 (SIPS)
@@ -24,15 +27,15 @@ default_password = "CHANGE_ME_TO_A_STRONG_PASSWORD"
 cert_path = ""
 key_path = ""
 
-# 端到端模式由客户端使用 ICE / DTLS-SRTP 建立媒体；Bria 兼容模式分配 UDP 中继端口。
-# 两种模式均要求 SHA-256 Digest；MESSAGE 均要求 JWE。
+# 签名 DTLS 模式由客户端建立媒体；SDES 和 ZRTP 模式使用服务器 UDP 中继。
+# 三种媒体模式均使用所配置的 Digest 算法（默认 SHA-256，MD5 为显式兼容）；MESSAGE 均要求 JWE。
 # 没有 [media] 时要求签名 SDP / DTLS-SRTP，详见 E2EE.md。
 # Bria 跨网络通话可在文件末尾启用以下兼容配置，详见 BRIA.md：
 # [media]
 # rtp_port_start = 20000
 # rtp_port_end = 20020
 # media_addr = "203.0.113.10"  # 替换为双方可达的服务器公网 IPv4
-# 兼容模式由服务器解密重加密语音，不是端到端加密。
+# mode = "sdes" 由服务器解密重加密语音；mode = "zrtp" 原样转发，双方强制 ZRTP 并核对 SAS。
 
 # 单独为分机设置密码（覆盖 default_password）
 # 格式：分机号 = "密码"

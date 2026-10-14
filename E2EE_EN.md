@@ -6,6 +6,8 @@ The call specification applies only to the signed DTLS profile **without `[media
 
 The repository supplies server admission checks and endpoint cryptographic tools, not a complete softphone. Ordinary Bria or ZRTP clients do not automatically implement signed SDP / JWE. For ZRTP calls see [ZRTP_EN.md](ZRTP_EN.md); for Bria SDES setup see [DEPLOYMENT_EN.md](DEPLOYMENT_EN.md).
 
+Login authentication is selected independently by `[server] digest_algorithm`: default `"sha256"`, or explicit `"md5"` compatibility, with TLS and `qop=auth` still required. It does not change media keys, identity signatures, fingerprints or JWE algorithms described here. See [DEPLOYMENT_EN.md](DEPLOYMENT_EN.md) for setup.
+
 ## Identity and key trust
 
 Each endpoint generates its own RSA-3072/4096 message encryption key and Ed25519 signing key. Never upload private keys to the server, generate them there or derive them from SIP passwords. The reference generator creates RSA-3072 keys.

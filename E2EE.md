@@ -6,6 +6,8 @@
 
 本仓库提供服务端准入检查和终端参考加密工具，不包含完整软电话。普通 Bria 或 ZRTP 客户端不会自动实现这里的签名 SDP / JWE 协议。ZRTP 语音接入见 [ZRTP.md](ZRTP.md)，Bria SDES 配置见 [DEPLOYMENT.md](DEPLOYMENT.md)。
 
+登录认证由 `[server] digest_algorithm` 独立选择：默认 `"sha256"`，Bria 兼容可显式设为 `"md5"`，仍强制 TLS 和 `qop=auth`。此设置不改变本文的媒体密钥、身份签名、指纹或 JWE 算法。启用步骤见 [DEPLOYMENT.md](DEPLOYMENT.md)。
+
 ## 信任与密钥
 
 - 每个客户端本地生成独立 RSA-3072/4096 消息加密密钥及 Ed25519 身份签名密钥。私钥不得上传服务器，不能由服务器生成或通过 SIP 登录密码派生。

@@ -51,6 +51,10 @@ docker compose logs -f
 
 Linux 上需授权容器 UID 10001 读取配置；UDP 映射、证书、升级及已发布镜像部署见 [DEPLOYMENT.md](DEPLOYMENT.md)。源码验证不代表远端 `latest` 已包含这些改动。
 
+首次复制模板默认使用 `digest_algorithm = "sha256"`。Bria Mobile 兼容登录需在现有 `[server]` 内改为 `digest_algorithm = "md5"`，然后重启；该设置适用于全部分机。根目录 `config.toml` 示例已选择 MD5 登录，但没有启用媒体中继。完整启用步骤见 [部署指南](DEPLOYMENT.md)。
+
+Docker 可将 `.env.example` 复制为 `.env`；端口变量只控制映射，不自动更新 TOML。
+
 ## 功能与限制
 
 - TLS 信令、可配置的 Digest 注册认证、连接及对话归属校验，有界队列、速率与超时限制。

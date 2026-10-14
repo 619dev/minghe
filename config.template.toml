@@ -12,7 +12,8 @@
 [server]
 # SIP Digest 默认 sha256；仅为不支持 SHA-256 的客户端显式启用 md5。
 # MD5 较弱，仍强制 TLS、qop=auth 和 nonce 重放检查；不改变媒体加密。
-# digest_algorithm = "md5"
+digest_algorithm = "sha256"
+# Bria Mobile 兼容时改为 digest_algorithm = "md5"
 # 监听地址（容器内建议保持 0.0.0.0）
 listen_addr = "0.0.0.0"
 

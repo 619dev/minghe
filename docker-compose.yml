@@ -31,8 +31,8 @@ services:
     ports:
       # SIP TLS 信令端口
       - "${SIP_PORT:-5061}:5061/tcp"
-      # SDES/ZRTP 中继（含奇数 RTCP 端口）；必须与 [media] 范围一致
-      - "20000-20020:20000-20020/udp"
+      # SDES/ZRTP 中继（含奇数 RTCP 端口）；.env 仅设置映射，TOML 端口范围须同步
+      - "${RTP_PORT_START:-20000}-${RTP_PORT_END:-20020}:${RTP_PORT_START:-20000}-${RTP_PORT_END:-20020}/udp"
 
     # 卷挂载
     volumes:

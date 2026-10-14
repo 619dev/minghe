@@ -2,6 +2,8 @@
 
 [English](DEPLOYMENT_EN.md) · [首页](README.md) · [ZRTP 接入](ZRTP.md) · [安全与验证](SECURITY.md)
 
+仓库配置入口：[config.template.toml](config.template.toml) 默认显式 SHA-256；[config.toml](config.toml) 是 MD5 兼容登录示例；Docker 读取 `config/config.toml`，该文件含本地密码、不提交。`.env` 同样不提交，可从 [.env.example](.env.example) 创建。升级时 `git pull` 不会更新被忽略的部署配置，需自行修改其中的 `digest_algorithm`。
+
 ## 配置与模式
 
 首次部署复制 `config.template.toml` 到 `config/config.toml`，设置服务器 host、至少 12 字节的强密码及分机独立密码。升级时编辑原配置，不用模板覆盖账号或证书设置。源码程序不带 `-c` 时默认读取根目录 `config.toml`；本文命令和 Docker 明确读取 `config/config.toml`。
@@ -80,12 +82,13 @@ docker compose up -d --force-recreate
 | Compose 变量 | 默认值 | 用途 |
 | --- | --- | --- |
 | `SIP_PORT` | `5061` | 宿主机 TCP 端口；容器目标仍为 5061 |
+| `RTP_PORT_START` / `RTP_PORT_END` | `20000` / `20020` | UDP 映射起止端口；与 TOML 同步，含奇数 RTCP |
 | `RUST_LOG` | `info` | 日志级别 |
 | `TZ` | `Asia/Shanghai` | 时区 |
 | `CPU_LIMIT` | `1.0` | CPU 限额 |
 | `MEM_LIMIT` | `512M` | 内存限额 |
 
-环境变量不替代 TOML 的账号、密码、host 和证书。修改 TOML 的 `sip_port` 时也需修改映射的容器目标端口。健康检查只确认进程存活，不代表注册或媒体可用。
+环境变量不替代 TOML 的账号、密码、host、digest_algorithm 和证书；RTP 变量只改变 Docker 映射，TOML 端口须同步。修改 TOML 的 `sip_port` 时也需修改映射的容器目标端口。健康检查只确认进程存活，不代表注册或媒体可用。
 
 ## TLS 与客户端
 

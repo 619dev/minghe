@@ -247,7 +247,7 @@ mod tests {
         );
         std::fs::write(
             &path,
-            valid.replace("[server]", "[server]\ndigest_algorithm = 'md5'"),
+            valid.replace("digest_algorithm = \"sha256\"", "digest_algorithm = 'md5'"),
         )
         .unwrap();
         assert_eq!(
@@ -259,7 +259,10 @@ mod tests {
         );
         std::fs::write(
             &path,
-            valid.replace("[server]", "[server]\ndigest_algorithm = 'automatic'"),
+            valid.replace(
+                "digest_algorithm = \"sha256\"",
+                "digest_algorithm = 'automatic'",
+            ),
         )
         .unwrap();
         assert!(AppConfig::load(path.to_str().unwrap()).is_err());

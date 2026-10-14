@@ -4,6 +4,8 @@
 
 Updated 2026-10-14. Applies to current source and reference tools, not a published image, production deployment or independent cryptographic audit.
 
+SHA-256 is the default authentication policy. Explicit `[server] digest_algorithm = "md5"` selects MD5 for every extension. The generic template retains SHA-256; the root compatibility example selects MD5. Actual Docker configuration is Git-ignored and not changed by pulling updates. The login algorithm does not establish media E2EE; the profiles below define those boundaries.
+
 ## Profile boundaries
 
 | Profile | Server media capabilities | Required endpoint verification |

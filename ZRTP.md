@@ -6,6 +6,8 @@
 
 客户端可使用支持 ZRTP 的 Linphone，见 [官方功能说明](https://www.linphone.org/en/features/)。具体版本必须同时支持本服务的 SIP/TLS、所配置的 Digest 算法及 `qop=auth` 和本页 SDP 配置。本次自动化测试没有运行真实 Linphone，不能据此声称任意客户端版本已验收。
 
+登录认证由 `[server] digest_algorithm` 独立选择：默认 `"sha256"`，Bria 兼容可显式设为 `"md5"`，仍强制 TLS 和 `qop=auth`。此设置不改变本文的媒体密钥、身份签名、指纹或 JWE 算法。启用步骤见 [DEPLOYMENT.md](DEPLOYMENT.md)。
+
 ## 服务配置
 
 在实际部署读取的 `config/config.toml` 中，将现有 `[media]` 设置为下面的模式；保留原来的真实公网地址和端口范围，不要重复添加表头：

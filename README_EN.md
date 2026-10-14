@@ -51,6 +51,10 @@ docker compose logs -f
 
 On Linux, grant container UID 10001 read access to configuration. See [deployment](DEPLOYMENT_EN.md) for UDP mappings, certificates, upgrades and published images. Source validation does not establish what is included in remote `latest`.
 
+The template explicitly selects `digest_algorithm = "sha256"`. For Bria Mobile compatibility, set `digest_algorithm = "md5"` inside the existing `[server]` table and restart; it affects all extensions. Root `config.toml` selects MD5 authentication without enabling a media relay. See [deployment](DEPLOYMENT_EN.md) for setup.
+
+Copy `.env.example` to `.env` for Docker. Port variables control mappings only and do not update TOML.
+
 ## Features and limitations
 
 - TLS signaling, configurable Digest registration, connection and dialog ownership checks, bounded queues, rates and timeouts.

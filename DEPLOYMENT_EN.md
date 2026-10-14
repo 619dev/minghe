@@ -2,6 +2,8 @@
 
 [中文](DEPLOYMENT.md) · [Home](README_EN.md) · [ZRTP setup](ZRTP_EN.md) · [Security and validation](SECURITY_EN.md)
 
+Configuration entry points: [config.template.toml](config.template.toml) explicitly defaults to SHA-256; [config.toml](config.toml) demonstrates MD5 compatibility. Docker reads `config/config.toml`, which contains local passwords and is not committed. `.env` is also ignored; create it from [.env.example](.env.example). Pulling updates does not change ignored deployment configuration; edit its `digest_algorithm` separately.
+
 ## Configuration and profiles
 
 For a new installation, copy `config.template.toml` to `config/config.toml` and set host, passwords of at least 12 bytes and individual extension passwords. Edit existing configuration during upgrades; do not replace accounts or certificate settings with the template. The source binary defaults to root `config.toml` without `-c`; commands here and Docker explicitly use `config/config.toml`.
@@ -80,12 +82,13 @@ The container runs as UID/GID 10001. Linux bind mount directories must be traver
 | Compose variable | Default | Purpose |
 | --- | --- | --- |
 | `SIP_PORT` | `5061` | Host TCP port; container target remains 5061 |
+| `RTP_PORT_START` / `RTP_PORT_END` | `20000` / `20020` | UDP mapping bounds; align with TOML, include odd RTCP ports |
 | `RUST_LOG` | `info` | Logging level |
 | `TZ` | `Asia/Shanghai` | Timezone |
 | `CPU_LIMIT` | `1.0` | CPU limit |
 | `MEM_LIMIT` | `512M` | Memory limit |
 
-Environment variables do not replace TOML accounts, passwords, host or certificates. Changing TOML `sip_port` also requires changing the container target mapping. Health checks establish process liveness, not registration or media availability.
+Environment variables do not replace TOML accounts, passwords, host, digest_algorithm or certificates. RTP variables change Docker mappings only; align TOML ports separately. Changing TOML `sip_port` also requires changing the container target mapping. Health checks establish process liveness, not registration or media availability.
 
 ## TLS and endpoints
 

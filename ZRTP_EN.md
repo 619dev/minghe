@@ -6,6 +6,8 @@ With explicit `mode = "zrtp"`, endpoints perform ZRTP key agreement and SRTP/SRT
 
 Linphone supports ZRTP; see its [official feature list](https://www.linphone.org/en/features/). The selected version must also support SIP/TLS, configured Digest authentication with `qop=auth` and the SDP requirements below. Automated tests did not run real Linphone endpoints and do not establish compatibility with every version.
 
+Login authentication is selected independently by `[server] digest_algorithm`: default `"sha256"`, or explicit `"md5"` compatibility, with TLS and `qop=auth` still required. It does not change media keys, identity signatures, fingerprints or JWE algorithms described here. See [DEPLOYMENT_EN.md](DEPLOYMENT_EN.md) for setup.
+
 ## Server configuration
 
 Set this profile in the deployment's `config/config.toml`, retaining actual public address and port settings. Do not duplicate table headers:
