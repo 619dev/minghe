@@ -169,8 +169,11 @@ pub async fn run(
                         tracing::error!("处理连接 {} 时出错: {}", peer_addr, e);
                     }
                 }
-                _ => {
-                    tracing::debug!("TLS 握手失败或超时 ({})", peer_addr);
+                Ok(Err(error)) => {
+                    tracing::warn!(peer = %peer_addr, error = %error, "TLS 握手失败；连接尚未进入 SIP 注册");
+                }
+                Err(_) => {
+                    tracing::warn!(peer = %peer_addr, "TLS 握手超时（10 秒）；检查客户端 TLS 配置和网络");
                 }
             }
         });
@@ -417,6 +420,12 @@ async fn process_sip_message(
         match method.as_str() {
             "REGISTER" => {
                 let response = state.registrar.handle_register(msg_text, peer_addr);
+                // Log the outcome, never the request or its Authorization credentials.
+                if let Ok(text) = std::str::from_utf8(&response) {
+                    if let Some(status) = parser::extract_status_code(text) {
+                        tracing::info!(peer = %peer_addr, status, "REGISTER 响应（401 为正常认证挑战）");
+                    }
+                }
 
                 // 检查是否注册成功（200 OK）
                 let mut pending_delivery: Option<(Arc<Router>, String)> = None;

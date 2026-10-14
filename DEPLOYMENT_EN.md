@@ -112,3 +112,18 @@ Buildx multi-platform `PUSH=0` builds do not load local images; Depot uses `--lo
 | Offline messages lost after restart | Queue is in memory; 200 does not mean successful endpoint decryption |
 
 Share redacted logs only: hide passwords, Digest Authorization, SDES keys, endpoint private keys and message plaintext.
+
+## TLS login diagnostics
+
+`Illegal SNI extension: ignoring IP address presented as hostname` means the client sent an IP in SNI and rustls ignored it. This alone does not establish handshake failure. Check subsequent handshake success/errors and REGISTER responses for the same connection. 401 is a normal authentication challenge; 400/403 or repeated 401 requires checking Digest and account configuration.
+
+The client address must match certificate SAN. Connecting to a public IP requires that IP SAN; a certificate generated for `minghe.local` does not cover the public IP. Changing host does not immediately replace an unexpired certificate in the volume. Inspect it first, then plan replacement and update endpoint trust. Do not delete the volume or disable verification to address the SNI warning.
+
+```bash
+docker compose logs --tail=200 minghe
+# Inspect public certificate identity/validity without reading the private key.
+docker compose exec -T minghe cat /app/certs/server.crt | \
+  openssl x509 -noout -subject -issuer -dates -ext subjectAltName
+```
+
+For external certificates substitute the actual cert_path. Confirm Android apps themselves trust the certificate; system installation alone may not establish app trust. When using a trusted domain certificate with the correct DNS SAN, configure that domain in clients.

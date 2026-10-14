@@ -55,7 +55,7 @@ Separate TURN must not terminate DTLS. Malicious same-IP sources or attackers ob
 
 ## Validation and reproduction
 
-The current voice changes passed 121 Rust tests, Release build, Clippy, formatting and diff checks. Existing unused-code/style warnings remain. Tests send actual local UDP packets: bidirectional Bria AES-CM/GCM decrypt/re-encrypt; ZRTP hashes and handshake byte forwarding; unchanged SRTP forwarding with independent endpoint keys and endpoint decryption; RTCP byte forwarding; downgrade, bind-failure and early hash-change rejection; resource cleanup.
+The current voice changes passed 122 Rust tests, Release build, Clippy, formatting and diff checks. Existing unused-code/style warnings remain. Tests send actual local UDP packets: bidirectional Bria AES-CM/GCM decrypt/re-encrypt; ZRTP hashes and handshake byte forwarding; unchanged SRTP forwarding with independent endpoint keys and endpoint decryption; RTCP byte forwarding; downgrade, bind-failure and early hash-change rejection; resource cleanup.
 
 ZRTP Hello and RTCP packets are constructed fixtures. Tests do not perform a real ZRTP key exchange, SAS check or cryptographic SRTCP verification. The voice changes did not rerun Python client/TLS tests, container operation or Cargo Audit, publish images or modify deployment configuration. Real audio, cross-network interoperability and mandatory endpoint encryption need acceptance. Historical audits do not establish current dependency safety.
 

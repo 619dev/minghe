@@ -62,7 +62,7 @@ On Linux, grant container UID 10001 read access to configuration. See [deploymen
 
 Supports REGISTER, INVITE, ACK, BYE, CANCEL, OPTIONS and MESSAGE with one active audio stream. Initial INVITE requires SDP. Video, offerless calls, re-INVITE and media negotiation in ACK are unsupported. ZRTP network address changes require a new call.
 
-The default media pool supports five relay calls. See [SECURITY_EN.md](SECURITY_EN.md) for other limits and security boundaries. 121 Rust tests passed, including bidirectional Bria SRTP and opaque ZRTP forwarding; no real ZRTP endpoint handshake was performed. Real audio, SAS and cross-network interoperability still require deployment acceptance.
+The default media pool supports five relay calls. See [SECURITY_EN.md](SECURITY_EN.md) for other limits and security boundaries. 122 Rust tests passed, including bidirectional Bria SRTP and opaque ZRTP forwarding; no real ZRTP endpoint handshake was performed. Real audio, SAS and cross-network interoperability still require deployment acceptance.
 
 ## Documentation and development
 

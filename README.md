@@ -62,7 +62,7 @@ Linux 上需授权容器 UID 10001 读取配置；UDP 映射、证书、升级�
 
 支持 REGISTER、INVITE、ACK、BYE、CANCEL、OPTIONS、MESSAGE，仅单个活动音频流。初始 INVITE 必须携带 SDP；不支持视频、offerless、re-INVITE 或 ACK 中协商媒体。ZRTP 通话中改变网络地址需挂断重拨。
 
-默认媒体端口池最多五通中继呼叫；其他容量和安全边界统一见 [SECURITY.md](SECURITY.md)。121 项 Rust 测试已通过，包括 Bria 双向 SRTP 和 ZRTP 透明转发；测试没有执行真实 ZRTP 客户端握手。真实双向声音、SAS 及跨网络互通仍需部署验收。
+默认媒体端口池最多五通中继呼叫；其他容量和安全边界统一见 [SECURITY.md](SECURITY.md)。122 项 Rust 测试已通过，包括 Bria 双向 SRTP 和 ZRTP 透明转发；测试没有执行真实 ZRTP 客户端握手。真实双向声音、SAS 及跨网络互通仍需部署验收。
 
 ## 文档与开发
 

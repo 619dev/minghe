@@ -160,10 +160,10 @@ impl RegistrarService {
             None => self.challenge_response(request_text, from_addr, &extension, false),
             Some(auth_value) => {
                 // 解析并验证 Digest 认证
-                let params = match parse_authorization(&auth_value) {
-                    Some(p) => p,
-                    None => {
-                        tracing::warn!("无法解析 Authorization 头部");
+                let params = match parse_authorization_checked(&auth_value) {
+                    Ok(p) => p,
+                    Err(reason) => {
+                        tracing::warn!(peer = %from_addr, reason, "REGISTER Digest 认证参数被拒绝（不记录凭据）");
                         return parser::build_response(request_text, 400, "Bad Request");
                     }
                 };
@@ -407,9 +407,18 @@ fn generate_nonce() -> String {
 /// 解析 Authorization 头部值
 ///
 /// 输入格式：`Digest username="1001", realm="minghe.local", nonce="xxx", uri="sip:minghe.local", response="yyy"`
+#[cfg(test)]
 fn parse_authorization(header_value: &str) -> Option<DigestParams> {
+    parse_authorization_checked(header_value).ok()
+}
+
+/// Return only fixed diagnostic labels; never include attacker-provided credentials.
+fn parse_authorization_checked(header_value: &str) -> Result<DigestParams, &'static str> {
     let value = header_value.trim();
-    let value = value.strip_prefix("Digest ")?.trim();
+    let value = value
+        .strip_prefix("Digest ")
+        .ok_or("expected Digest authentication scheme")?
+        .trim();
 
     let mut username = String::new();
     let mut realm = String::new();
@@ -428,7 +437,7 @@ fn parse_authorization(header_value: &str) -> Option<DigestParams> {
         if let Some((key, val)) = param.split_once('=') {
             let key = key.trim().to_ascii_lowercase();
             if !seen.insert(key.clone()) {
-                return None;
+                return Err("duplicate Digest parameter");
             }
             let val = val.trim().trim_matches('"').to_string();
             match key.as_str() {
@@ -440,24 +449,29 @@ fn parse_authorization(header_value: &str) -> Option<DigestParams> {
                 "qop" => qop = Some(val),
                 "nc" => nc = Some(val),
                 "cnonce" => cnonce = Some(val),
-                "algorithm" if !val.eq_ignore_ascii_case("SHA-256") => return None,
+                "algorithm" if !val.eq_ignore_ascii_case("SHA-256") => {
+                    return Err(if val.eq_ignore_ascii_case("MD5") {
+                        "client selected MD5; server requires SHA-256"
+                    } else {
+                        "unsupported Digest algorithm; server requires SHA-256"
+                    });
+                }
                 _ => {}
             }
         }
     }
 
-    if username.is_empty()
-        || realm.is_empty()
-        || nonce.is_empty()
-        || uri.is_empty()
-        || response.len() != 64
-        || !response.bytes().all(|b| b.is_ascii_hexdigit())
-        || !seen.contains("algorithm")
-    {
-        return None;
+    if !seen.contains("algorithm") {
+        return Err("missing Digest algorithm; server requires explicit SHA-256");
+    }
+    if username.is_empty() || realm.is_empty() || nonce.is_empty() || uri.is_empty() {
+        return Err("missing required Digest identity/challenge parameter");
+    }
+    if response.len() != 64 || !response.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("invalid Digest response format; SHA-256 requires 64 hex digits");
     }
 
-    Some(DigestParams {
+    Ok(DigestParams {
         username,
         realm,
         nonce,
@@ -633,6 +647,22 @@ mod tests {
         );
         assert!(parse_authorization(&valid.replace(", algorithm=SHA-256", "")).is_none());
         assert!(parse_authorization(&valid.replace(&"a".repeat(64), &"a".repeat(32))).is_none());
+    }
+
+    #[test]
+    fn digest_diagnostics_do_not_disclose_credentials() {
+        let secret = "DO_NOT_LOG_CREDENTIALS";
+        let header = format!("Digest username={secret}, realm=r, nonce={secret}, uri=sip:r, response={}, algorithm=MD5", "a".repeat(32));
+        let error = parse_authorization_checked(&header).unwrap_err();
+        assert_eq!(error, "client selected MD5; server requires SHA-256");
+        assert!(!error.contains(secret));
+        let error =
+            parse_authorization_checked(&header.replace(", algorithm=MD5", "")).unwrap_err();
+        assert_eq!(
+            error,
+            "missing Digest algorithm; server requires explicit SHA-256"
+        );
+        assert!(!error.contains(secret));
     }
 
     #[test]

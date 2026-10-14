@@ -112,3 +112,18 @@ Buildx 的 `PUSH=0` 多平台构建不加载本地镜像；Depot 使用 `--load`
 | 重启后离线消息消失 | 队列只在内存中；200 不等于客户端成功解密 |
 
 只共享脱敏日志，隐藏密码、Digest Authorization、SDES 密钥、终端私钥和消息正文。
+
+## TLS 登录诊断
+
+`Illegal SNI extension: ignoring IP address presented as hostname` 表示客户端把 IP 放进 SNI，rustls 忽略该字段；它本身不能证明握手失败。先查看同一连接随后是否出现“TLS 握手成功”、具体握手失败原因以及 REGISTER 响应。401 是正常认证挑战；400/403 或反复 401 需要排查 Digest 和账号配置。
+
+客户端连接地址必须与证书 SAN 匹配。连接公网 IP 时，需要证书包含对应 IP SAN；配置仍是 `minghe.local` 时自动生成的证书不覆盖公网 IP。改变 host 不会立即替换证书卷中未过期的现有证书；先检查实际证书，再安排更新并重新导入客户端信任。不要为处理 SNI 警告删除证书卷或关闭证书验证。
+
+```bash
+docker compose logs --tail=200 minghe
+# 显示公有证书的身份和有效期，不读取私钥。
+docker compose exec -T minghe cat /app/certs/server.crt | \
+  openssl x509 -noout -subject -issuer -dates -ext subjectAltName
+```
+
+外部证书配置时，将命令中的路径换为实际 cert_path。Android 客户端须确认其自身能信任所用证书，仅安装到系统证书列表不一定代表应用已信任。采用有正确 DNS SAN 的受信任域名证书时，客户端应填写该域名。

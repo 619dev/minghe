@@ -55,7 +55,7 @@ ZRTP 的 Hello hash 用于关联媒体来源与 SIP 会话，不替代 SAS，也
 
 ## 验证范围与复现
 
-当前语音改动通过 121 项 Rust 测试、Release 构建、Clippy、格式与 diff 检查；Clippy 仍有未使用代码及风格警告。Rust 测试实际发送本机 UDP 包，覆盖 Bria 双向 AES-CM/GCM 解密重加密、ZRTP hash 与握手字节转发、两端独立密钥的 SRTP 原样转发及终端解密、RTCP 字节转发、降级/端口失败/早期 hash 变更拒绝和资源释放。
+当前语音改动通过 122 项 Rust 测试、Release 构建、Clippy、格式与 diff 检查；Clippy 仍有未使用代码及风格警告。Rust 测试实际发送本机 UDP 包，覆盖 Bria 双向 AES-CM/GCM 解密重加密、ZRTP hash 与握手字节转发、两端独立密钥的 SRTP 原样转发及终端解密、RTCP 字节转发、降级/端口失败/早期 hash 变更拒绝和资源释放。
 
 ZRTP Hello 与 RTCP 是构造的测试消息，测试没有执行真实 ZRTP 密钥交换、SAS 或 SRTCP 密码学验证。本次语音改动没有重跑 Python 客户端/TLS 集成测试、容器运行和 Cargo Audit，也没有发布镜像或修改部署配置。真实音频、跨网络互通及客户端强制加密需要另行验收；历史审计结果不能代表当前依赖安全。
 
