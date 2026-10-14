@@ -1,4 +1,4 @@
-//! Bria-compatible SDES-SRTP relay profile (explicit [media] configuration).
+//! Explicit media relay profiles: Bria SDES-SRTP or opaque endpoint ZRTP.
 //!
 //! 处理 INVITE、ACK、BYE、CANCEL 等呼叫相关的 SIP 请求。
 //! 作为 B2BUA（Back-to-Back User Agent）工作，中继信令并管理媒体会话。
@@ -81,6 +81,8 @@ pub struct CallInfo {
     pub callee_relay_port: u16,
     /// 媒体中继是否已启动
     pub relay_started: bool,
+    zrtp_answer_hashes: Option<crate::media::zrtp::HelloHashes>,
+    zrtp_answer_mux: bool,
 }
 
 /// 呼叫路由器
@@ -97,6 +99,7 @@ pub struct SdesRouter {
     domain: String,
     /// 媒体地址
     media_addr: String,
+    mode: crate::config::MediaMode,
     /// 连接映射：分机号 -> 写入通道（由 server 模块更新，与 MessageService 共享）
     connection_writers: Arc<RwLock<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
     /// 即时消息服务（MESSAGE 在线转发与离线暂存/补投）
@@ -128,9 +131,19 @@ impl SdesRouter {
             media_manager,
             domain,
             media_addr,
+            mode: crate::config::MediaMode::Sdes,
             connection_writers,
             message_service,
         }
+    }
+
+    pub fn with_mode(mut self, mode: crate::config::MediaMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    fn is_zrtp(&self) -> bool {
+        self.mode == crate::config::MediaMode::Zrtp
     }
 
     /// Bind dialog actions to the exact TLS channel that established the call.
@@ -327,28 +340,23 @@ impl SdesRouter {
             }
         };
 
-        if !is_sdp(request_text) || !valid_sdes_sdp(&invite_body) {
+        if !is_sdp(request_text)
+            || !(if self.is_zrtp() {
+                crate::media::zrtp::validate_sdp(&invite_body).is_some()
+            } else {
+                valid_sdes_sdp(&invite_body)
+            })
+        {
             return parser::build_response(request_text, 488, "Not Acceptable Here");
         }
-        let (caller_remote_crypto_tag, caller_remote_crypto) =
+        let (caller_remote_crypto_tag, caller_remote_crypto) = if self.is_zrtp() {
+            (0, None)
+        } else {
             match extract_srtp_crypto_from_sdp(&invite_body) {
-                Some((tag, crypto)) => {
-                    tracing::debug!(
-                        "主叫 {} 提供 a=crypto (tag={}, suite={})，使用强制 SRTP B2BUA 模式",
-                        caller_ext,
-                        tag,
-                        crypto.suite_name()
-                    );
-                    (tag, crypto)
-                }
-                None => {
-                    tracing::warn!(
-                        "拒绝 INVITE：强制 SRTP 模式要求主叫 SDP 携带 a=crypto (Call-ID={})",
-                        call_id
-                    );
-                    return parser::build_response(request_text, 488, "Not Acceptable Here");
-                }
-            };
+                Some((tag, crypto)) => (tag, Some(crypto)),
+                None => return parser::build_response(request_text, 488, "Not Acceptable Here"),
+            }
+        };
         let caller_media_addr = extract_audio_media_addr_from_sdp(&invite_body);
 
         // 分配媒体中继端口
@@ -360,32 +368,59 @@ impl SdesRouter {
             }
         };
 
-        // 强制 SRTP：服务端分别向主叫、被叫声明自己的 SRTP 密钥。
-        // 主叫侧使用主叫 offer 中被选中的套件（与 answer 保持一致）；
-        // 被叫侧同时提供 AES_CM_128 与 AEAD_AES_128_GCM 两种套件，供被叫选择。
-        let caller_local_crypto = SrtpCryptoSuite::new_with_suite(caller_remote_crypto.suite());
-        let callee_local_crypto = SrtpCryptoSuite::new(); // AES_CM_128 (tag 1)
-        let callee_local_crypto_gcm = SrtpCryptoSuite::new_with_suite(SrtpSuite::AeadAes128Gcm); // AEAD_AES_128_GCM (tag 2)
+        let (caller_local_crypto, callee_local_crypto, callee_local_crypto_gcm, new_sdp) = if self
+            .is_zrtp()
+        {
+            (
+                None,
+                None,
+                None,
+                crate::media::zrtp::rewrite_sdp(
+                    &invite_body,
+                    &self.media_addr,
+                    relay_session.callee_port,
+                ),
+            )
+        } else {
+            // 强制 SRTP：服务端分别向主叫、被叫声明自己的 SRTP 密钥。
+            // 主叫侧使用主叫 offer 中被选中的套件（与 answer 保持一致）；
+            // 被叫侧同时提供 AES_CM_128 与 AEAD_AES_128_GCM 两种套件，供被叫选择。
+            let caller_local_crypto = SrtpCryptoSuite::new_with_suite(
+                caller_remote_crypto
+                    .as_ref()
+                    .expect("validated SDES offer")
+                    .suite(),
+            );
+            let callee_local_crypto = SrtpCryptoSuite::new(); // AES_CM_128 (tag 1)
+            let callee_local_crypto_gcm = SrtpCryptoSuite::new_with_suite(SrtpSuite::AeadAes128Gcm); // AEAD_AES_128_GCM (tag 2)
 
-        // 修改 SDP：替换媒体地址和端口，并强制声明 RTP/SAVP + SDES crypto
-        let callee_cryptos = vec![
-            parser::SdpCrypto {
-                tag: 1,
-                suite: callee_local_crypto.suite_name().to_string(),
-                key_b64: callee_local_crypto.to_sdes_key(),
-            },
-            parser::SdpCrypto {
-                tag: 2,
-                suite: callee_local_crypto_gcm.suite_name().to_string(),
-                key_b64: callee_local_crypto_gcm.to_sdes_key(),
-            },
-        ];
-        let new_sdp = parser::rewrite_sdp_with_cryptos(
-            &invite_body,
-            &self.media_addr,
-            relay_session.callee_port,
-            &callee_cryptos,
-        );
+            // 修改 SDP：替换媒体地址和端口，并强制声明 RTP/SAVP + SDES crypto
+            let callee_cryptos = vec![
+                parser::SdpCrypto {
+                    tag: 1,
+                    suite: callee_local_crypto.suite_name().to_string(),
+                    key_b64: callee_local_crypto.to_sdes_key(),
+                },
+                parser::SdpCrypto {
+                    tag: 2,
+                    suite: callee_local_crypto_gcm.suite_name().to_string(),
+                    key_b64: callee_local_crypto_gcm.to_sdes_key(),
+                },
+            ];
+            let new_sdp = parser::rewrite_sdp_with_cryptos(
+                &invite_body,
+                &self.media_addr,
+                relay_session.callee_port,
+                &callee_cryptos,
+            );
+
+            (
+                Some(caller_local_crypto),
+                Some(callee_local_crypto),
+                Some(callee_local_crypto_gcm),
+                new_sdp,
+            )
+        };
 
         let target_uri = registered_contact_uri(&callee_ext, &self.domain, &self.registrar);
         tracing::debug!(
@@ -417,17 +452,19 @@ impl SdesRouter {
             callee_invite: String::from_utf8(callee_invite.clone()).expect("SIP UTF-8"),
             caller_writer: caller_writer.clone(),
             callee_writer: Some(callee_writer.clone()),
-            caller_remote_crypto: Some(caller_remote_crypto),
+            caller_remote_crypto,
             caller_remote_crypto_tag,
-            caller_local_crypto: Some(caller_local_crypto),
+            caller_local_crypto,
             callee_remote_crypto: None,
-            callee_local_crypto: Some(callee_local_crypto),
-            callee_local_crypto_gcm: Some(callee_local_crypto_gcm),
+            callee_local_crypto,
+            callee_local_crypto_gcm,
             caller_media_addr,
             callee_media_addr: None,
             caller_relay_port: relay_session.caller_port,
             callee_relay_port: relay_session.callee_port,
             relay_started: false,
+            zrtp_answer_hashes: None,
+            zrtp_answer_mux: false,
         };
 
         {
@@ -468,16 +505,25 @@ impl SdesRouter {
         };
 
         let body = parser::extract_body(response_text).unwrap_or_default();
-        let invalid = (status_code == 200
-            && (body.is_empty() || parser::extract_to_tag(response_text).is_none()))
-            || (!body.is_empty()
-                && (!is_sdp(response_text)
-                    || !valid_sdes_sdp(&body)
-                    || parser::extract_header_value(response_text, "X-Minghe-Identity").is_some()))
-            || (status_code == 200
-                && !extract_srtp_crypto_from_sdp(&body).is_some_and(|(tag, crypto)| {
-                    callee_answer_crypto_is_offered(tag, crypto.suite())
-                }));
+        let invalid = if self.is_zrtp() {
+            (status_code == 200
+                && (body.is_empty() || parser::extract_to_tag(response_text).is_none()))
+                || (!body.is_empty()
+                    && (!is_sdp(response_text)
+                        || crate::media::zrtp::validate_sdp(&body).is_none()))
+        } else {
+            (status_code == 200
+                && (body.is_empty() || parser::extract_to_tag(response_text).is_none()))
+                || (!body.is_empty()
+                    && (!is_sdp(response_text)
+                        || !valid_sdes_sdp(&body)
+                        || parser::extract_header_value(response_text, "X-Minghe-Identity")
+                            .is_some()))
+                || (status_code == 200
+                    && !extract_srtp_crypto_from_sdp(&body).is_some_and(|(tag, crypto)| {
+                        callee_answer_crypto_is_offered(tag, crypto.suite())
+                    }))
+        };
         if invalid {
             self.reject_media_response(response_text, &call_id, status_code)
                 .await;
@@ -518,7 +564,9 @@ impl SdesRouter {
                     if call.callee_remote_contact.is_none() {
                         call.callee_remote_contact = parser::extract_contact_uri(response_text);
                     }
-                    if let Some((tag, crypto)) = parser::extract_body(response_text)
+                    if self.is_zrtp() {
+                        call.state = CallState::Established;
+                    } else if let Some((tag, crypto)) = parser::extract_body(response_text)
                         .as_deref()
                         .and_then(extract_srtp_crypto_from_sdp)
                     {
@@ -566,7 +614,8 @@ impl SdesRouter {
             media_addr = self.media_addr.clone();
             original_invite = call.original_invite.clone();
             callee_ext = call.callee_ext.clone();
-            missing_required_srtp = status_code == 200 && call.callee_remote_crypto.is_none();
+            missing_required_srtp =
+                !self.is_zrtp() && status_code == 200 && call.callee_remote_crypto.is_none();
         };
 
         if missing_required_srtp {
@@ -580,7 +629,24 @@ impl SdesRouter {
 
         // 用原始 INVITE 的头部重建响应给主叫
         // 这样 Via、From、To、CSeq、Call-ID 都和主叫的原始请求匹配
-        let forwarded_response = if let Some(body) = parser::extract_body(response_text) {
+        if self.is_zrtp() && !body.is_empty() {
+            if let Err(error) = self.start_zrtp_relay(&call_id, &body).await {
+                tracing::error!("ZRTP relay bind failed: {}", error);
+                self.reject_media_response(response_text, &call_id, status_code)
+                    .await;
+                return;
+            }
+        }
+        let forwarded_response = if self.is_zrtp() && !body.is_empty() {
+            build_forwarded_invite_response(
+                &original_invite,
+                response_text,
+                status_code,
+                reason_phrase(response_text),
+                &server_contact_uri(&callee_ext, &self.domain),
+                &crate::media::zrtp::rewrite_sdp(&body, &media_addr, caller_relay_port),
+            )
+        } else if let Some(body) = parser::extract_body(response_text) {
             // 有 SDP body — 修改媒体地址和端口，并强制写回 SRTP 参数
             let caller_crypto = match {
                 let calls = self.active_calls.read().unwrap();
@@ -682,7 +748,7 @@ impl SdesRouter {
         }
 
         // 如果是 200 OK，且中继尚未启动，启动媒体中继
-        if status_code == 200 {
+        if status_code == 200 && !self.is_zrtp() {
             let should_start = {
                 let mut calls = self.active_calls.write().unwrap();
                 if let Some(call) = calls.get_mut(&call_id) {
@@ -946,6 +1012,59 @@ impl SdesRouter {
             }
         }
         self.cleanup_call(id);
+    }
+
+    async fn start_zrtp_relay(&self, call_id: &str, answer: &str) -> Result<(), String> {
+        let (caller_port, callee_port, hashes) = {
+            let calls = self.active_calls.read().unwrap();
+            let call = calls.get(call_id).ok_or("missing call")?;
+            let answer_hashes = crate::media::zrtp::validate_sdp(answer).ok_or("invalid answer")?;
+            let answer_mux = answer.lines().any(|l| l == "a=rtcp-mux");
+            if call.relay_started {
+                return if call.zrtp_answer_hashes.as_ref() == Some(&answer_hashes)
+                    && call.zrtp_answer_mux == answer_mux
+                {
+                    Ok(())
+                } else {
+                    Err("ZRTP transport changed after early answer".into())
+                };
+            }
+            let offer = parser::extract_body(&call.original_invite).ok_or("missing offer")?;
+            if answer_mux && !offer.lines().any(|l| l == "a=rtcp-mux") {
+                return Err("answer selected unoffered RTCP mux".into());
+            }
+            (
+                call.caller_relay_port,
+                call.callee_relay_port,
+                [
+                    crate::media::zrtp::validate_sdp(&offer).ok_or("invalid offer")?,
+                    answer_hashes,
+                ],
+            )
+        };
+        // Bind before advertising the answer; never report success with unavailable UDP ports.
+        let sockets = crate::media::zrtp::bind(caller_port, callee_port)
+            .await
+            .map_err(|e| e.to_string())?;
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        {
+            let mut calls = self.active_calls.write().unwrap();
+            let call = calls.get_mut(call_id).ok_or("call ended while binding")?;
+            if call.relay_started {
+                return Err("relay already started".into());
+            }
+            call.relay_started = true;
+            call.zrtp_answer_hashes = Some(hashes[1].clone());
+            call.zrtp_answer_mux = answer.lines().any(|l| l == "a=rtcp-mux");
+            self.media_manager.register_shutdown(call_id, tx);
+        }
+        let manager = self.media_manager.clone();
+        let id = call_id.to_string();
+        tokio::spawn(async move {
+            crate::media::zrtp::run(sockets, hashes, rx).await;
+            manager.finish_session(&id);
+        });
+        Ok(())
     }
 
     /// 启动媒体中继

@@ -51,13 +51,14 @@ default_password = "CHANGE_ME_TO_A_STRONG_PASSWORD"
 cert_path = ""
 key_path = ""
 
-# Bria 跨网络通话：取消下列注释启用 TLS + SDES-SRTP 中继。
+# 可选媒体中继；部署与 Bria 接入见 DEPLOYMENT.md。
+# mode = "sdes"（默认）：服务器解密重加密 SRTP，不是端到端加密。
+# mode = "zrtp"：原样转发；双方强制 ZRTP、禁用 ICE 并核对 SAS，见 ZRTP.md。
+# 不设置整个 [media] 表：签名 SDP / DTLS-SRTP，需适配 E2EE.md 协议。
 # media_addr 填双方可访问的服务器公网 IPv4，不能填 Docker IP。
-# 服务器终止媒体加密，该模式不是端到端加密；禁止明文 RTP。
-# 端口范围必须与 Docker UDP 映射及防火墙一致。
-# 保留旧版 [media] 配置即可恢复旧版媒体链路。
-# 没有 [media] 时使用 E2EE.md 中的端到端客户端协议。
+# 端口范围与 Docker/防火墙一致；ZRTP 起止值均为偶数，包含奇数 RTCP 端口。
 # [media]
+# mode = "sdes"
 # rtp_port_start = 20000
 # rtp_port_end = 20020
 # media_addr = "203.0.113.10"

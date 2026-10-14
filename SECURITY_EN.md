@@ -1,57 +1,63 @@
-# Security mechanisms and verification record
+# Security boundaries and validation
 
-**Profile scope:** The E2EE guarantees below apply only without `[media]`. With `[media]`, the restored Bria SDES-SRTP relay holds media keys and decrypts/re-encrypts audio; it is not E2EE. SIP authentication, dialog ownership and JWE MESSAGE restrictions remain. See [BRIA_EN.md](BRIA_EN.md).
+[中文](SECURITY.md) · [Home](README_EN.md) · [Deployment](DEPLOYMENT_EN.md)
 
-[中文](SECURITY.md) · [E2EE specification](E2EE_EN.md) · [Deployment and migration](DEPLOYMENT_EN.md)
+Updated 2026-10-14. Applies to current source and reference tools, not a published image, production deployment or independent cryptographic audit.
 
-Updated 2026-10-14. This record covers repository source, endpoint helpers and local tests. It does not establish published-image behavior, production deployment or an independent cryptographic audit.
+## Profile boundaries
 
-## Encryption boundary
+| Profile | Server media capabilities | Required endpoint verification |
+| --- | --- | --- |
+| ZRTP: `[media] mode = "zrtp"` | Forwards handshake/media unchanged; holds no media keys; cannot distinguish plaintext/ciphertext RTP payloads or verify SRTP/SRTCP tags | Require ZRTP, authenticate media, compare SAS; see [ZRTP_EN.md](ZRTP_EN.md) |
+| SDES: `[media] mode = "sdes"` or mode omitted | Holds per-leg keys and decrypts/re-encrypts audio; not end-to-end encrypted | TLS certificate verification and SDES-SRTP |
+| Signed DTLS: no `[media]` | Routes SDP unchanged with no media relay; checks identity envelope admission only | Pin peer public keys, verify Ed25519 signatures and actual DTLS fingerprints; see [E2EE_EN.md](E2EE_EN.md) |
 
-Without `[media]`, the server routes signaling and encrypted MESSAGE only. The explicit Bria profile includes SDES key negotiation and SRTP decryption/re-encryption. Media crypto dependencies are runtime dependencies. Docker maps UDP 20000–20020 for that profile.
+ZRTP Hello hashes associate media sources with SIP sessions; they do not replace SAS or prove completed key exchange. A server can modify signaling. Server login authentication is not peer identity authentication. The relay offers no encryption fallback, but endpoints must prohibit plaintext media.
 
-In the E2EE profile, endpoints establish DTLS-SRTP. Signed SDP binds identities, Call-ID, offer/answer role, exact SDP bytes and time. Server envelope admission is not signature verification: endpoints must independently pin peer keys, verify signatures and match actual DTLS certificates to the signed fingerprints. Missing or failed checks must stop the call.
+MESSAGE in every profile accepts only restricted RSA-OAEP-256 / AES-256-GCM JWE. Only receiving endpoints can verify the inner Ed25519 signature and plaintext; the server checks the outer envelope. Endpoints must verify AEAD, signatures, identities, validity and persistent replay state before display. Ordinary SIP text and unrelated native chat protocols are incompatible.
 
-Messages use RSA-OAEP-256 / AES-256-GCM JWE containing an Ed25519-signed JWT. Endpoints generate private keys, content keys and nonces locally. They verify AEAD, signatures, identities, expiration and durable replay state before showing plaintext. The server cannot validate the encrypted inner signature. See [the full integration specification](E2EE_EN.md); this repository does not contain a complete softphone.
+## Shared protections and media restrictions
 
-## Implemented controls
+- SIP/TLS with client certificate verification; self-signed keys use 0600 permissions, automatic renewal and TLS reload.
+- SHA-256 Digest `qop=auth`; MD5 and omitted algorithms rejected. Nonces bind accounts/connections, expire in five minutes and require increasing nc values.
+- Register before use; From matches authenticated identity. Dialog actions bind original TLS channels and direction, responses check CSeq, and expired/replaced registrations revoke old identities.
+- Duplicate critical headers, folded headers and control characters rejected; Digest credentials removed before delivery/queueing; forged From handled.
+- Invalid early SDP cancels the outbound INVITE; invalid 200 answers trigger ACK/BYE for valid peer dialogs and cleanup.
+- ZRTP RTP sources pin only after Hello matches SDP. At most one initial Hello is cached per side. Other sources cannot replace addresses. Separate RTCP sources must share the RTP source IP; endpoints still authenticate SRTCP. Address changes require redialing.
+- SDES learns NAT addresses from authenticated SRTP and checks replay. AES-CM/GCM supported; separate RTCP forwarding unavailable.
+- Signed DTLS rejects SDES, SDP keys, plaintext profiles and missing identities. SDP/signatures remain unchanged; endpoints independently verify signatures.
+- Endpoint tools generate keys locally, use encrypted PKCS#8, exclusive 0600 files and persistent SQLite replay state; no SIP dialing or media implementation.
+- Non-root containers, read-only root filesystems, no capabilities/privilege escalation; placeholder passwords and passwords shorter than 12 bytes rejected.
 
-| Control | Behavior |
+## Capacity
+
+| Resource | Limit |
 | --- | --- |
-| E2EE downgrade rejection | Offers and SDP-bearing early/final answers require DTLS-SRTP, SHA-256 fingerprint, setup, RTCP mux and identity envelopes; reject plaintext, SDES and SDP keys |
-| E2EE key isolation | The E2EE profile starts no media decryption contexts or relay tasks; server configuration contains no endpoint private keys |
-| Bria relay boundary | Explicit `[media]` enables SDES-SRTP decryption/re-encryption with separate keys, authenticated NAT destination learning and SRTP replay checks; signed E2EE offers and plaintext RTP are rejected |
-| E2EE negotiation binding | Preserve SDP and identity signatures; bind envelopes to accounts, calls, roles, hashes and time; endpoint verifies cryptography |
-| Rejected-call cleanup | Cancel incompatible early responses using the INVITE branch; ACK/BYE invalid final answers with valid callee dialog tags |
-| Message admission | Require restricted five-segment JWE; reject plaintext, signature-only messages, weak algorithms, compression, key URLs and duplicate/unknown JOSE fields |
-| Endpoint integrity/replay | Verify GCM, Ed25519, identities, UUID v4 and time; transactionally persist SQLite replay state before output, reject database failures and repeats after restart |
-| Endpoint key storage | Password-encrypted PKCS#8, exclusively created 0600 private files, independently verified public bundles, no silent replacement |
-| Registration | SHA-256 Digest `qop=auth`; reject MD5, missing algorithms and malformed responses; account/connection-bound nonces expire in 5 minutes; atomic increasing nonce counts |
-| Identity/dialog ownership | REGISTER first; From matches authenticated account; dialog methods bind original connections and direction; validate callee CSeq; replacement/expiration invalidates old identity |
-| Framing/credentials | Reject duplicate critical headers (including compact Content-Type), folding and control characters; reject unverified dialog bodies; remove Digest credentials and forged From before delivery/storage |
-| Passwords/TLS | Reject placeholder or sub-12-byte passwords; write self-signed private keys with 0600 permissions and atomic replacement; clients must verify TLS |
-| Capacity/deployment | Bound connections, frames, queues, rates and calls; check call quotas (the E2EE profile also rechecks on insertion); non-root container, read-only root, dropped capabilities and no privilege escalation |
+| TCP/TLS | 256 connections; 10-second handshake; unauthenticated/authenticated idle limits 120/3600 seconds |
+| Frames/processing | Headers 16 KiB, frame 64 KiB; incomplete frame 15 seconds; processing/writes 10 seconds; queue 16 items |
+| Rates | 300 SIP messages/minute/connection; 60 REGISTER requests/minute/source IP, including challenges/retries |
+| Extensions/registration | 10000 extensions; one account/connection; registration up to 3600 seconds |
+| Calls | Two/caller, 256 globally; pending 120 seconds, established four hours; 30-second cleanup cycle; media pool may impose lower limits |
+| MESSAGE | Body 4 KiB, request 8 KiB; offline TTL 24 hours, 100/recipient, 10000 globally |
+| Offline sender quotas | 120/minute and 500 concurrently/sender; full recipient queues evict oldest entries |
 
-## Limits
+Offline queues are in memory and lost at restart. 200 means server acceptance, not endpoint verification/decryption. Assess source-IP limits for large shared NAT deployments.
 
-- 256 TCP/TLS connections; handshake 10 seconds; unauthenticated idle 120 seconds, authenticated idle 3600 seconds; incomplete frames 15 seconds; request processing/writes 10 seconds.
-- 300 SIP messages per connection per minute; 60 REGISTER requests per source IP per minute, including challenges/retries. Evaluate shared-NAT capacity.
-- 16 KiB headers, 64 KiB frames, 16 queued outbound frames, at most 10000 extension numbers.
-- Registration at most 3600 seconds and one account per connection; 2 calls per caller, 256 globally; pending timeout 120 seconds, established timeout 4 hours, cleanup every 30 seconds.
-- MESSAGE body 4 KiB, request 8 KiB; offline TTL 24 hours, 100 per recipient (evict oldest when full), 10000 globally; each sender may queue 120 per minute and hold 500 pending. Queues are memory-only; 200 does not acknowledge recipient decryption.
-- One active audio stream; RTCP mux is required in the E2EE profile; no offerless, video, re-INVITE or media negotiation in ACK. E2EE endpoints provide ICE/STUN and independent TURN where needed. Bria instead needs a reachable relay IPv4 and matching UDP mappings/firewall rules.
+Every profile supports one active audio stream, without video, offerless calls, re-INVITE or media negotiation in ACK. Signed DTLS requires RTCP mux and endpoint ICE/separate TURN when needed. ZRTP disables ICE and supports mux/separate RTCP; SDES uses the server relay. See [deployment](DEPLOYMENT_EN.md) for port pool capacity.
 
-## Remaining boundaries
+## Guarantees not provided
 
-The server sees metadata and SDP and can drop, delay or replay traffic. Endpoint compromise can expose plaintext. SIP credentials and server TLS certificates do not establish peer identity.
+The server observes accounts, addresses, SDP, call times and ciphertext lengths and can block, delay or replay traffic. Metadata anonymity and network availability are not provided. Compromised endpoints or private keys can expose content.
 
-Static RSA messaging has **no forward secrecy, post-compromise recovery or Double Ratchet**. Later recipient-key compromise can expose recorded ciphertext. Multi-device, groups, automated rotation/revocation, recovery and encrypted backups are unimplemented. Keep replay databases and peer trust persistent; do not reuse completed call contexts.
+Static RSA message encapsulation lacks forward secrecy, post-compromise recovery and Double Ratchet. A future recipient private-key compromise can decrypt recorded messages. Multi-device support, groups, automatic rotation/revocation and encrypted backups are absent. Replay state and identity trust must persist.
 
-TURN must not terminate DTLS. Do not disable TLS, signature or AEAD checks for compatibility. Tests do not establish absence of vulnerabilities. Actual clients, cross-NAT audio and container startup still need validation; deployment firewalls and upstream rate controls are needed where stronger traffic protection is required.
+Separate TURN must not terminate DTLS. Malicious same-IP sources or attackers observing ZRTP handshakes can still cause denial of service. Source tests cannot replace real-client acceptance, dependency auditing or independent security review.
 
-## Verification and release
+## Validation and reproduction
 
-The Bria fix passed 116 Rust regression tests, release build, Clippy, formatting and diff checks; `docker compose config --quiet` also passed. A new Rust test sends actual local UDP SRTP packets through INVITE, 200, ACK, bidirectional AES-CM/GCM decryption/re-encryption and BYE, and verifies that signed offers do not enter the relay. The earlier E2EE implementation recorded 7 endpoint cryptography tests and 1 loopback TLS/SIP integration test; these Python tests were not rerun for the Bria fix or this documentation update. Reproduce with:
+The current voice changes passed 121 Rust tests, Release build, Clippy, formatting and diff checks. Existing unused-code/style warnings remain. Tests send actual local UDP packets: bidirectional Bria AES-CM/GCM decrypt/re-encrypt; ZRTP hashes and handshake byte forwarding; unchanged SRTP forwarding with independent endpoint keys and endpoint decryption; RTCP byte forwarding; downgrade, bind-failure and early hash-change rejection; resource cleanup.
+
+ZRTP Hello and RTCP packets are constructed fixtures. Tests do not perform a real ZRTP key exchange, SAS check or cryptographic SRTCP verification. The voice changes did not rerun Python client/TLS tests, container operation or Cargo Audit, publish images or modify deployment configuration. Real audio, cross-network interoperability and mandatory endpoint encryption need acceptance. Historical audits do not establish current dependency safety.
 
 ```bash
 cargo test --locked
@@ -59,16 +65,16 @@ cargo build --release --locked
 cargo clippy --locked --all-targets
 cargo fmt --check
 git diff --check
-docker compose config --quiet
-# Targeted regression; requires permission to bind local UDP sockets:
+# Both focused tests require local UDP bind permissions.
 cargo test --locked bria_profile -- --nocapture
+cargo test --locked zrtp_profile -- --nocapture
+docker compose config --quiet
+# After installing endpoint tool dependencies:
 python -m unittest discover -s tools -p 'test_e2ee_client.py' -v
 MINGHE_BINARY=/absolute/path/to/target/release/minghe \
   python -m unittest discover -s tools -p 'test_e2ee_transport.py' -v
+# Install cargo-audit separately and refresh the audit before release.
+cargo audit
 ```
 
-Install `tools/requirements-e2ee.txt` in the endpoint Python environment first. The transport test listens only on loopback, uses temporary identities/configuration/certificates and checks TLS verification, SHA-256 registration, offline ciphertext delivery, endpoint replay rejection and real signed SDP routing. It sends no audio.
-
-Clippy retains unused-code/style warnings. Compose configuration validation is not a container startup test. Container execution and RustSec dependency auditing were not performed for the Bria fix. The old 2026-09-29 audit cannot establish this revision's status. Run a fresh dependency audit, validate real clients and cross-NAT media, and obtain independent review before release.
-
-No image publication or production deployment was performed. Compose sets `build: .` and `image: facilisvelox/minghe:latest`; `up --build` builds and tags local source without publishing. A remote `latest` is not evidence that this fix is included.
+Dependencies are in `tools/requirements-e2ee.txt`. TLS/SIP integration uses temporary identities, certificates and configuration on 127.0.0.1 to check registration, offline ciphertext delivery, replay rejection and signed SDP routing; it sends no audio. See [E2EE_EN.md](E2EE_EN.md) for protocol and tool usage.

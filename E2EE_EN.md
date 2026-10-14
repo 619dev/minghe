@@ -1,12 +1,10 @@
-# End-to-end encryption integration specification
+# Signed DTLS-SRTP and JWE integration specification
 
-**Profile scope:** The E2EE guarantees below apply only without `[media]`. With `[media]`, the restored Bria SDES-SRTP relay holds media keys and decrypts/re-encrypts audio; it is not E2EE. SIP authentication, dialog ownership and JWE MESSAGE restrictions remain. See [BRIA_EN.md](BRIA_EN.md).
+[中文](E2EE.md) · [Home](README_EN.md) · [Deployment](DEPLOYMENT_EN.md) · [Security and validation](SECURITY_EN.md)
 
-[中文](E2EE.md) · [Security](SECURITY_EN.md) · [Deployment and migration](DEPLOYMENT_EN.md)
+The call specification applies only to the signed DTLS profile **without `[media]`**. The server forwards SDP unchanged and starts no media relay; clients must implement the identity verification and DTLS-SRTP described below. The MingHe JWE message protocol applies to every profile.
 
-This specification describes the default profile without `[media]`. In this profile, MingHe routes signaling and encrypted messages without exchanging media keys or running a UDP decryption relay; SDES-SRTP, plaintext RTP and plaintext MESSAGE are rejected. Bria compatibility is a separate startup profile, not an automatic downgrade.
-
-**This repository provides server admission rules and an endpoint cryptographic reference tool, not a complete softphone. Clients must implement identity verification, DTLS-SRTP and the message profile below. Updating the server alone does not give Bria or Linkvil this E2EE protocol. For Bria relay calls, follow [BRIA_EN.md](BRIA_EN.md) instead.**
+The repository supplies server admission checks and endpoint cryptographic tools, not a complete softphone. Ordinary Bria or ZRTP clients do not automatically implement signed SDP / JWE. For ZRTP calls see [ZRTP_EN.md](ZRTP_EN.md); for Bria SDES setup see [DEPLOYMENT_EN.md](DEPLOYMENT_EN.md).
 
 ## Identity and key trust
 
@@ -119,12 +117,8 @@ The command interactively reads and confirms a private-key password of at least 
 
 End stdin with EOF. Strip the CLI's terminal output newline when placing values into SIP headers/bodies; Content-Length counts final body bytes. Client integrations may call module functions and replace file storage with a trusted local key store.
 
-## Remaining boundaries
+## Security and validation
 
-The server sees accounts, online status, IPs, SDP, timing and ciphertext sizes and can block, delay, replay or drop traffic. This profile does not provide metadata anonymity or availability guarantees. Endpoint compromise can reveal content.
+Static RSA message encapsulation provides neither forward secrecy nor post-compromise recovery. The tools are a single-device reference implementation. Protect and persist endpoint private keys, pinned public identities and replay databases. Signed SDP and server TLS trust do not replace one another.
 
-**Static RSA message wrapping provides neither forward secrecy nor post-compromise recovery.** Later compromise of a recipient private key can decrypt previously recorded messages. This is not equivalent to Signal; a prekey/Double Ratchet protocol requires a separate audited implementation.
-
-The reference implementation is single-device, with no groups, device synchronization, automatic rotation/revocation, trusted key directory or encrypted backup. Protect persistent identity and replay state. SIP server certificate trust does not replace peer identity verification.
-
-E2EE tests cover real message encryption, tampering, identity replacement, expiration, persistent replay, SDP direction/Call-ID binding and loopback TLS/SIP transport. The separate Bria Rust regression verifies bidirectional local UDP SRTP; it does not verify E2EE ICE/DTLS audio. Actual softphone interoperability and cross-NAT media remain unverified. Complete endpoint integration and independent security review before production use.
+Capacity, security boundaries, test commands and verified scope are maintained in [SECURITY_EN.md](SECURITY_EN.md). Networking and deployment are in [DEPLOYMENT_EN.md](DEPLOYMENT_EN.md). Existing tests do not establish real-endpoint ICE / DTLS audio interoperability.

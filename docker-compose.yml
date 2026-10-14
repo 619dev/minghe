@@ -5,9 +5,10 @@
 # 使用方法:
 #   1. 复制配置模板:  cp config.template.toml config/config.toml
 #   2. 编辑配置文件:  vim config/config.toml
-#   3. 启动服务:      docker compose up -d --build
-#   4. 查看日志:      docker compose logs -f
-#   5. 停止服务:      docker compose down
+#   3. 构建本地镜像:  docker build -t facilisvelox/minghe:latest .
+#   4. 启动服务:      docker compose up -d --force-recreate
+#   5. 查看日志:      docker compose logs -f
+#   6. 停止服务:      docker compose down
 #
 # ============================================================
 
@@ -30,7 +31,7 @@ services:
     ports:
       # SIP TLS 信令端口
       - "${SIP_PORT:-5061}:5061/tcp"
-      # Bria SRTP 中继；必须与 [media] 的端口范围一致
+      # SDES/ZRTP 中继（含奇数 RTCP 端口）；必须与 [media] 范围一致
       - "20000-20020:20000-20020/udp"
 
     # 卷挂载

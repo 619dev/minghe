@@ -62,13 +62,24 @@ pub struct TlsConfig {
     pub key_path: String,
 }
 
-/// TLS + SDES-SRTP compatibility profile; the server terminates media encryption.
+/// SDES compatibility or opaque ZRTP relay; selected explicitly, never downgraded.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MediaConfig {
+    #[serde(default)]
+    pub mode: MediaMode,
     pub rtp_port_start: u16,
     pub rtp_port_end: u16,
     pub media_addr: String,
+}
+
+/// Explicit profiles never fall back to one another.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaMode {
+    #[default]
+    Sdes,
+    Zrtp,
 }
 
 impl AppConfig {
@@ -130,6 +141,9 @@ impl AppConfig {
             {
                 return Err("媒体端口范围至少需要两个非零偶数 RTP 端口".into());
             }
+            if media.mode == MediaMode::Zrtp && media.rtp_port_end % 2 != 0 {
+                return Err("ZRTP 媒体端口范围结束值必须为偶数，确保包含配对的 RTCP 端口".into());
+            }
             let ip = media
                 .media_addr
                 .parse::<std::net::Ipv4Addr>()
@@ -137,7 +151,14 @@ impl AppConfig {
             if ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast() {
                 return Err("media_addr 必须是客户端可访问的服务器 IPv4 地址".into());
             }
-            tracing::warn!("已启用 Bria 兼容 SRTP 中继：服务器终止媒体加密，此模式不是端到端加密");
+            match media.mode {
+                MediaMode::Sdes => tracing::warn!(
+                    "已启用 Bria 兼容 SRTP 中继：服务器终止媒体加密，此模式不是端到端加密"
+                ),
+                MediaMode::Zrtp => tracing::info!(
+                    "已启用 ZRTP 密文中继：密钥由客户端协商；客户端必须强制 ZRTP 并核对 SAS"
+                ),
+            }
         }
 
         // 校验独立密码中的分机号是否在范围内
@@ -197,7 +218,32 @@ mod tests {
             format!("{valid}\n[media]\nmedia_addr = '203.0.113.10'\nrtp_port_start = 20000\nrtp_port_end = 20010\n"),
         )
         .unwrap();
-        assert!(AppConfig::load(path.to_str().unwrap()).is_ok());
+        assert_eq!(
+            AppConfig::load(path.to_str().unwrap())
+                .unwrap()
+                .media
+                .unwrap()
+                .mode,
+            MediaMode::Sdes
+        );
+        let zrtp = format!("{valid}\n[media]\nmode = 'zrtp'\nmedia_addr = '203.0.113.10'\nrtp_port_start = 20000\nrtp_port_end = 20020\n");
+        std::fs::write(&path, &zrtp).unwrap();
+        assert_eq!(
+            AppConfig::load(path.to_str().unwrap())
+                .unwrap()
+                .media
+                .unwrap()
+                .mode,
+            MediaMode::Zrtp
+        );
+        std::fs::write(
+            &path,
+            zrtp.replace("rtp_port_end = 20020", "rtp_port_end = 20021"),
+        )
+        .unwrap();
+        assert!(AppConfig::load(path.to_str().unwrap()).is_err());
+        std::fs::write(&path, zrtp.replace("'zrtp'", "'automatic'")).unwrap();
+        assert!(AppConfig::load(path.to_str().unwrap()).is_err());
         for bad in [
             template.to_string(),
             valid.replace("test-only-long-password", "short"),

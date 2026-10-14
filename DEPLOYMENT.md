@@ -1,45 +1,67 @@
 # 部署、升级与发布
 
-[English](DEPLOYMENT_EN.md) · [首页](README.md) · [端到端协议](E2EE.md) · [安全验证记录](SECURITY.md)
+[English](DEPLOYMENT_EN.md) · [首页](README.md) · [ZRTP 接入](ZRTP.md) · [安全与验证](SECURITY.md)
 
-## Bria 兼容模式
+## 配置与模式
 
-旧版 Bria 用户保留或恢复 `[media]`，填写服务器公网 IPv4，并放行匹配的 UDP 范围，详见 [BRIA.md](BRIA.md)。该配置显式启用 TLS + SDES-SRTP 中继，服务器终止媒体加密。下面的端到端迁移要求适用于没有 `[media]` 的默认端到端模式。
+首次部署复制 `config.template.toml` 到 `config/config.toml`，设置服务器 host、至少 12 字节的强密码及分机独立密码。升级时编辑原配置，不用模板覆盖账号或证书设置。源码程序不带 `-c` 时默认读取根目录 `config.toml`；本文命令和 Docker 明确读取 `config/config.toml`。
 
-## 迁移到端到端模式
+| 模式 | 配置 | 网络与客户端 |
+| --- | --- | --- |
+| ZRTP | `[media] mode = "zrtp"` | 公网 IPv4、UDP 中继；双方强制 ZRTP、禁用 ICE、核对 SAS，见 [ZRTP.md](ZRTP.md) |
+| Bria SDES | `[media] mode = "sdes"` 或不设置 mode | 公网 IPv4、UDP 中继；SDES-SRTP，服务器可解密语音 |
+| 签名 DTLS | 删除整个 `[media]` | 客户端适配 [E2EE.md](E2EE.md)，自行配置 ICE/STUN 及必要的独立 TURN |
 
-端到端模式与未适配的 Bria/SDES 客户端不兼容。先在两台实际终端实现 SHA-256 Digest `qop=auth`、签名 SDP、DTLS-SRTP 和 JWE MESSAGE，并通过独立渠道核对对方公钥包指纹。客户端参考工具不提供拨号或媒体功能。私钥只在各终端生成和保存，不放入服务器配置、镜像或卷。
+模式在启动时确定，不能按呼叫自动切换。迁移前先确认双方客户端支持目标模式，备份配置与 TLS 证书；签名 DTLS 客户端还需保护身份、固定指纹和重放数据库。重启会丢失内存中的未投递离线消息。
 
-选择端到端模式时删除整个 `[media]` 节，并移除服务器中继的 UDP 映射和防火墙规则。保留 `[media]` 会选择 Bria 中继模式。客户端自行配置 ICE/STUN；需要中继时使用不终止 DTLS 的独立 TURN。不得通过关闭证书验证、接受 SDES 或明文回退解决互通问题。
+中继配置示例，`media_addr` 必须换成双方能访问的服务器真实公网 IPv4：
 
-备份服务器配置与 TLS 证书，并保护客户端身份、固定的公钥指纹和持久重放数据库。离线消息队列仅在内存中，重启会丢失未投递密文。回滚旧服务器会恢复旧安全边界，不能继续按当前端到端承诺使用。
+```toml
+[media]
+mode = "sdes" # ZRTP 客户端改为 "zrtp"
+rtp_port_start = 20000
+rtp_port_end = 20020
+media_addr = "203.0.113.10"
+```
 
-## 配置和运行
+端口池包含起点、不包含终点，使用偶数 RTP 端口。默认 SDES 每通占两个端口；ZRTP 每通占两个 RTP 及两个奇数 RTCP 端口，起止值均须为偶数。默认两种中继均最多五通。Compose 映射整个 UDP `20000-20020`；修改范围时同步修改 TOML、Compose、安全组和防火墙。公网地址不能填容器地址、`0.0.0.0` 或手机地址。
 
-首次部署时，从 [config.template.toml](config.template.toml) 复制到 `config/config.toml`，替换 host 和全部启用的密码占位值。根目录 [config.toml](config.toml) 是另一份示例，不是默认部署目录。密码至少 12 字节，优先为每个分机设置不同的随机密码。
+签名 DTLS 模式不使用本服务的 UDP 媒体端口，可移除这部分映射；独立 TURN 的端口单独管理。不要以关闭证书验证或启用明文回退解决连接失败。
 
-升级时编辑现有部署配置，不要用模板覆盖账号、证书路径或 `[media]`。Bria 媒体端口默认映射 UDP `20000-20020`，它不是环境变量；自定义 TOML 范围时必须同步调整 Compose 和防火墙。
+## 源码运行
 
-源码运行需要 Rust 1.88+：
+需要 Rust 1.88+：
 
 ```bash
 mkdir -p config
 cp config.template.toml config/config.toml
 chmod 600 config/config.toml
-# 编辑配置，替换占位值。
+# 编辑配置，替换占位值并选择通话模式。
 cargo build --release --locked
 ./target/release/minghe -c config/config.toml
 ```
 
-Compose 从当前源码构建 `facilisvelox/minghe:latest`：
+## Docker 运行与升级
+
+当前 `docker-compose.yml` 只有 `image`，没有 `build`。使用当前源码时先构建，再重建容器：
 
 ```bash
-docker compose up -d --build
+docker build -t facilisvelox/minghe:latest .
+docker compose up -d --force-recreate
 docker compose logs -f
-docker compose down
 ```
 
-容器以 UID/GID 10001 运行。Linux bind mount 的配置目录需要可遍历，配置文件需要该 UID 可读；宿主用户所有且仅 0600 的文件通常不能直接被它读取。可通过文件所有权、专用组或 ACL 给 UID 10001 最小只读权限，保持配置挂载 `:ro`。外部证书及私钥同样需要容器可读；证书目录需要续期写入权限。默认命名卷负责持久保存 `/app/certs`，不要删除该卷来重启服务。
+使用已发布镜像时先确认镜像版本，再拉取并启动；不要在本地源码构建后执行 pull 覆盖它：
+
+```bash
+# 仅用于部署已发布镜像。
+docker compose pull
+docker compose up -d --force-recreate
+```
+
+生产部署宜将 Compose 的 image 固定为经过验收的版本标签或 digest。当前源码验证不能证明远端 `latest` 内容；ZRTP 改动尚未在本次工作中发布。`docker compose down` 停止服务，保留证书卷；不要用 `down -v` 删除证书。
+
+容器以 UID/GID 10001 运行。Linux bind mount 目录需可遍历，配置和外部证书/私钥需该 UID 可读；宿主用户所有的 0600 文件通常不能直接被容器读取。使用文件所有权、专用组或 ACL 授予所需权限，保持配置挂载只读。默认 `/app/certs` 命名卷持久保存证书并允许续期写入。
 
 | Compose 变量 | 默认值 | 用途 |
 | --- | --- | --- |
@@ -49,39 +71,44 @@ docker compose down
 | `CPU_LIMIT` | `1.0` | CPU 限额 |
 | `MEM_LIMIT` | `512M` | 内存限额 |
 
-这些环境变量不替代 TOML 的账号、密码、host 或证书配置。若修改 TOML 的 `sip_port`，也要修改 Compose 映射的容器目标端口。端到端模式仅需开放 SIP/TLS TCP 端口；Bria 兼容模式还需开放配置的 UDP 媒体范围；独立 TURN 的端口由其部署单独管理。健康检查只验证进程存活，不证明注册、端到端身份或媒体可用。
+环境变量不替代 TOML 的账号、密码、host 和证书。修改 TOML 的 `sip_port` 时也需修改映射的容器目标端口。健康检查只确认进程存活，不代表注册或媒体可用。
 
-公网部署使用受信任 CA 证书，`cert_path` 与 `key_path` 同时设置。自签名模式生成 `certs/server.crt` 和私钥；Docker 中在证书卷内，需从卷中安全导出公有证书供客户端导入信任。续期后更新客户端信任，始终启用证书验证。服务器证书与终端身份公钥是两个独立信任关系。
+## TLS 与客户端
 
-## 构建和发布镜像
+公网使用受信任 CA 证书，`cert_path` 和 `key_path` 同时设置。留空时生成自签名证书 `certs/server.crt`；Docker 中位于证书卷。将公有证书导入客户端信任，续期后更新信任；私钥不得分发。服务器 TLS 信任和通话对方身份验证是独立步骤。
 
-[build-and-push.sh](build-and-push.sh) 支持 Depot 和 Docker Buildx。**默认 `PUSH=1` 会推送远端；指定非 latest 的 TAG 时，还会同时更新 latest。** 文档更新或本地测试无需执行发布命令。
+Bria 使用 SIP/TLS、SHA-256 Digest `qop=auth`，启用 SDES-SRTP 并验证服务器证书。确认版本支持这些功能。两端主动发送 SRTP 才能建立 NAT 返回路径；服务端仅从认证成功的 SRTP 包学习地址。支持 AES_CM_128_HMAC_SHA1_80 与 AEAD_AES_128_GCM，不提供独立 RTCP/SRTCP 转发。此模式不是端到端加密。
+
+ZRTP 的客户端设置和 SAS 验收集中在 [ZRTP.md](ZRTP.md)。所有模式只接受鸣鹤 JWE MESSAGE，不支持 Bria 普通文本消息；签名 DTLS 与消息工具集中在 [E2EE.md](E2EE.md)。
+
+## 镜像发布
+
+[build-and-push.sh](build-and-push.sh) 支持 Depot 和 Docker Buildx，默认 `PUSH=1` 会推送；非 latest 的 TAG 还会更新 latest。文档更新不需要执行发布。
 
 ```bash
-# 单平台本地构建并加载，不推送；按实际架构选择平台。
+# 单平台本地构建并加载，不推送；平台按部署环境选择。
 PUSH=0 BUILDER=buildx PLATFORM=linux/amd64 TAG=media-review ./build-and-push.sh
 
-# 完成发布验证后推送到自己的仓库；也会更新该仓库 latest。
+# 完成验收后发布到指定仓库，同时更新 latest。
 REPO=YOUR_DOCKER_HUB_USER TAG=YOUR_RELEASE_TAG ./build-and-push.sh
 ```
 
-Buildx 的 `PUSH=0` 多平台模式仅验证构建，不加载本地镜像；Depot 模式使用其 `--load` 行为。Compose 同时设置 `build: .` 和 `image: facilisvelox/minghe:latest`；`up --build` 从本地源码构建并在本地打该标签，不会推送远端。要部署已发布镜像，显式修改 Compose image/build 或使用脚本打印的 docker run 指令，并保留容器限制、配置只读挂载和证书持久卷。当前源码修改尚未发布镜像。
+Buildx 的 `PUSH=0` 多平台构建不加载本地镜像；Depot 使用 `--load`。使用自定义仓库或标签时同步修改 Compose 的 image。发布前按 [SECURITY.md](SECURITY.md) 运行检查，并完成真实终端、跨网络和容器验收。
 
-## 部署验收和常见问题
-
-发布前运行 [安全说明中的测试命令](SECURITY.md)，安装端点工具依赖，重新进行 Cargo Audit，并验证实际终端的双向音频、跨 NAT/TURN、证书信任、指纹替换拒绝、重放拒绝和容器运行。Rust Bria 回归测试实际发送双向 UDP SRTP 包，并覆盖 AES-CM/GCM 两端；独立 Python TLS/SIP 集成测试验证信令和加密消息，不发送语音。两者均不能替代真实跨 NAT Bria 验收。
+## 排查
 
 | 现象 | 检查 |
 | --- | --- |
-| 启动拒绝配置 | host、密码占位值及长度、分机范围、证书路径是否成对设置 |
-| 容器无法读取配置/证书 | UID 10001 文件读取和目录遍历权限、挂载位置 |
-| 注册持续失败 | TLS 信任、SHA-256 与 qop=auth、正确账号密码、连接绑定及来源 IP 速率限制 |
-| Bria 呼叫收到 488 | 是否已启用 `[media]`，两端是否提供支持的 SDES-SRTP 套件；此模式拒绝明文 RTP、DTLS 指纹和签名端到端 offer |
-| 端到端呼叫收到 488 | SDP 协议、RTCP mux、setup、指纹、身份封装及签名的原始 SDP 字节是否满足规范 |
-| Bria 接听后无声音 | `media_addr` 是否为公网 IPv4，TOML/Compose/防火墙的 UDP 范围是否一致，两端是否发送 SRTP，以及两个方向的首包转发日志 |
-| 端到端信令成功但没有音频 | 客户端验签、实际 DTLS 指纹、ICE 候选和独立 TURN 连通性 |
-| MESSAGE 收到 415 | 是否为 application/jose 五段受限 JWE，是否误发明文或附加 CLI 换行 |
-| 消息在客户端被拒绝 | 固定的对方指纹、GCM/签名、收发身份、时钟和重放记录；不要关闭校验 |
-| 服务重启后无离线消息 | 队列仅在内存中；200 不等于客户端已解密 |
+| 配置启动失败 | 密码占位值及长度、host、分机范围、成对证书路径、mode 及媒体端口范围 |
+| 容器无法读配置或证书 | UID 10001 的读取/目录遍历权限和挂载路径 |
+| 注册失败 | TLS 信任、SHA-256 / qop=auth、账号密码及来源 IP 限流 |
+| Bria 呼叫 488 | SDES 模式及支持的套件；拒绝 DTLS 指纹、签名身份 offer 和明文协议 |
+| ZRTP 呼叫 488 | Hello hash、ZRTP 1.10、禁用 ICE、仅音频；中继端口是否可绑定 |
+| 签名 DTLS 呼叫 488 | 原始 SDP 字节、身份封装、fingerprint、setup、RTCP mux |
+| 中继接听后无声 | 公网 IPv4、完整 UDP 映射、防火墙、双方是否发送媒体/Hello；ZRTP 客户端是否完成握手 |
+| 签名 DTLS 无声 | 客户端验签、实际 DTLS 指纹、ICE 候选及 TURN 连通性 |
+| MESSAGE 415 | application/jose、受限五段 JWE、是否附加 CLI 换行或发送原生聊天协议 |
+| 接收端拒绝消息 | 固定指纹、GCM/签名、收发身份、时间和重放数据库 |
+| 重启后离线消息消失 | 队列只在内存中；200 不等于客户端成功解密 |
 
-仅共享脱敏后的日志；不要发送配置密码、Digest Authorization、端点私钥或消息正文用于排查。
+只共享脱敏日志，隐藏密码、Digest Authorization、SDES 密钥、终端私钥和消息正文。

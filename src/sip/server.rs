@@ -552,6 +552,7 @@ mod tests {
         inner.router = Arc::new(
             Router::new(inner.registrar.clone(), "example.com".into(), 1000, 2000).with_media(
                 &crate::config::MediaConfig {
+                    mode: crate::config::MediaMode::Sdes,
                     rtp_port_start: port,
                     rtp_port_end: port + 4,
                     media_addr: "127.0.0.1".into(),
@@ -673,6 +674,283 @@ mod tests {
         .expect("both directions must carry decryptable audio");
         process_sip_message(&request("BYE", "1001", ""), caller, caller_tx, &state).await;
         assert!(!state.router.has_active_call("security-call"));
+    }
+
+    #[tokio::test]
+    async fn zrtp_profile_routes_hashes_and_opaque_bidirectional_srtp() {
+        zrtp_profile_test("").await;
+    }
+
+    #[tokio::test]
+    async fn zrtp_profile_rejects_answer_downgrade() {
+        zrtp_profile_test("downgrade").await;
+    }
+
+    #[tokio::test]
+    async fn zrtp_profile_rejects_unavailable_udp_ports() {
+        zrtp_profile_test("bind").await;
+    }
+
+    #[tokio::test]
+    async fn zrtp_profile_rejects_changed_hello_after_early_media() {
+        zrtp_profile_test("early").await;
+    }
+
+    async fn zrtp_profile_test(failure: &str) {
+        use crate::media::{srtp::SrtpCryptoSuite, zrtp};
+        use tokio::{
+            net::UdpSocket,
+            time::{timeout, Duration},
+        };
+        let (port, reservation) = {
+            let mut pair = None;
+            let start = match failure {
+                "downgrade" => 23000,
+                "bind" => 26000,
+                "early" => 17000,
+                _ => 20000,
+            };
+            for p in (start..start + 3000).step_by(4) {
+                if let Ok(sockets) = zrtp::bind(p, p + 2).await {
+                    pair = Some((p, sockets));
+                    break;
+                }
+            }
+            pair.expect("four available relay ports")
+        };
+        let mut state = fixture();
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.router = Arc::new(
+            Router::new(inner.registrar.clone(), "example.com".into(), 1000, 2000).with_media(
+                &crate::config::MediaConfig {
+                    mode: crate::config::MediaMode::Zrtp,
+                    rtp_port_start: port,
+                    rtp_port_end: port + 4,
+                    media_addr: "127.0.0.1".into(),
+                },
+                1000,
+                2000,
+            ),
+        );
+        let (caller, caller_tx, mut caller_rx) = connect(&state, "1001", 16001);
+        let (callee, callee_tx, mut callee_rx) = connect(&state, "1002", 16002);
+        let (caller_hello, caller_hash) = zrtp::tests::hello(1);
+        let (callee_hello, callee_hash) = zrtp::tests::hello(2);
+        let sdp = |hash: &str| {
+            format!("v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\ns=-\r\nc=IN IP4 10.0.0.1\r\nt=0 0\r\nm=audio 4000 RTP/AVP 0\r\na=zrtp-hash:1.10 {hash}\r\n")
+        };
+        let invite = |body: &str| {
+            request("INVITE", "1001", body)
+                .lines()
+                .filter(|l| !l.starts_with("X-Minghe-Identity:"))
+                .collect::<Vec<_>>()
+                .join("\r\n")
+                + "\r\n"
+        };
+        // Neither plaintext-only nor SDES calls may enter the ZRTP profile.
+        process_sip_message(
+            &invite(&sdp(&caller_hash).replace("a=zrtp-hash:", "a=unknown:")),
+            caller,
+            caller_tx.clone(),
+            &state,
+        )
+        .await;
+        assert_eq!(
+            parser::extract_status_code(
+                std::str::from_utf8(&caller_rx.recv().await.unwrap()).unwrap()
+            ),
+            Some(488)
+        );
+        process_sip_message(
+            &invite(&sdp(&caller_hash)),
+            caller,
+            caller_tx.clone(),
+            &state,
+        )
+        .await;
+        assert_eq!(
+            parser::extract_status_code(
+                std::str::from_utf8(&caller_rx.recv().await.unwrap()).unwrap()
+            ),
+            Some(100)
+        );
+        let forwarded = String::from_utf8(callee_rx.recv().await.unwrap()).unwrap();
+        assert!(forwarded.contains(&caller_hash));
+        assert!(forwarded.contains(&format!("m=audio {} RTP/AVP", port + 2)));
+        assert!(!forwarded.contains("a=crypto:"));
+        let answer = if failure == "downgrade" {
+            sdp(&callee_hash).replace("a=zrtp-hash:", "a=unknown:")
+        } else {
+            sdp(&callee_hash)
+        };
+        let response = format!("SIP/2.0 200 OK\r\nFrom: <sip:1001@example.com>;tag=caller\r\nTo: <sip:1002@example.com>;tag=callee\r\nContact: <sip:1002@example.com>\r\nCall-ID: security-call\r\nCSeq: 1 INVITE\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{}", answer.len(), answer);
+        let reservation = if failure == "bind" {
+            Some(reservation)
+        } else {
+            drop(reservation);
+            None
+        };
+        if failure == "early" {
+            let early = response.replace("SIP/2.0 200 OK", "SIP/2.0 183 Session Progress");
+            process_sip_message(&early, callee, callee_tx.clone(), &state).await;
+            let early = String::from_utf8(caller_rx.recv().await.unwrap()).unwrap();
+            assert_eq!(parser::extract_status_code(&early), Some(183));
+        }
+        let response = if failure == "early" {
+            response.replace(&callee_hash, &caller_hash)
+        } else {
+            response
+        };
+        process_sip_message(&response, callee, callee_tx, &state).await;
+        let forwarded = String::from_utf8(caller_rx.recv().await.unwrap()).unwrap();
+        if !failure.is_empty() {
+            assert_eq!(parser::extract_status_code(&forwarded), Some(488));
+            assert!(!state.router.has_active_call("security-call"));
+            for method in ["ACK ", "BYE "] {
+                assert!(String::from_utf8(callee_rx.recv().await.unwrap())
+                    .unwrap()
+                    .starts_with(method));
+            }
+            drop(reservation);
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    if zrtp::bind(port, port + 2).await.is_ok() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("rejected answer releases relay sockets");
+            return;
+        }
+        assert!(forwarded.contains(&callee_hash));
+        assert!(forwarded.contains(&format!("m=audio {port} RTP/AVP")));
+        assert!(forwarded.contains(&format!("a=rtcp:{}", port + 1)));
+        process_sip_message(
+            &request("ACK", "1001", ""),
+            caller,
+            caller_tx.clone(),
+            &state,
+        )
+        .await;
+        assert!(String::from_utf8(callee_rx.recv().await.unwrap())
+            .unwrap()
+            .starts_with("ACK "));
+        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut buffer = [0; 4096];
+        // Invalid Hello cannot seize the destination, even before the real endpoint arrives.
+        attacker
+            .send_to(&callee_hello, ("127.0.0.1", port))
+            .await
+            .unwrap();
+        a.send_to(&caller_hello, ("127.0.0.1", port)).await.unwrap();
+        b.send_to(&callee_hello, ("127.0.0.1", port + 2))
+            .await
+            .unwrap();
+        let (n, _) = timeout(Duration::from_secs(1), a.recv_from(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..n], &callee_hello);
+        let (n, _) = timeout(Duration::from_secs(1), b.recv_from(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..n], &caller_hello);
+        // Other handshake messages are passed through without termination or rewriting.
+        for kind in [
+            b"HelloACK",
+            b"Commit  ",
+            b"DHPart1 ",
+            b"DHPart2 ",
+            b"Confirm1",
+            b"Confirm2",
+            b"Conf2ACK",
+        ] {
+            let mut handshake = caller_hello[..12].to_vec();
+            handshake.extend([0x50, 0x5a, 0, 3]);
+            handshake.extend(kind);
+            handshake.extend([0; 4]);
+            a.send_to(&handshake, ("127.0.0.1", port)).await.unwrap();
+            let (n, _) = timeout(Duration::from_secs(1), b.recv_from(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&buffer[..n], &handshake);
+        }
+        // Simulated endpoint keys: this test checks transparent media transport,
+        // not a real ZRTP key exchange. The relay never receives either key.
+        let mut a_crypto = SrtpCryptoSuite::new();
+        let mut b_crypto = SrtpCryptoSuite::new();
+        let mut receive_a = b_crypto.clone();
+        let mut receive_b = a_crypto.clone();
+        let frame = [0x80, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 10, 20, 30];
+        let encrypted_a = a_crypto.protect_rtp(&frame).unwrap();
+        let encrypted_b = b_crypto.protect_rtp(&frame).unwrap();
+        a.send_to(&encrypted_a, ("127.0.0.1", port)).await.unwrap();
+        b.send_to(&encrypted_b, ("127.0.0.1", port + 2))
+            .await
+            .unwrap();
+        let (n, _) = timeout(Duration::from_secs(1), b.recv_from(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..n], &encrypted_a);
+        assert_eq!(receive_b.unprotect_rtp(&buffer[..n]).unwrap(), frame);
+        let (n, _) = timeout(Duration::from_secs(1), a.recv_from(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..n], &encrypted_b);
+        assert_eq!(receive_a.unprotect_rtp(&buffer[..n]).unwrap(), frame);
+        attacker
+            .send_to(&caller_hello, ("127.0.0.1", port))
+            .await
+            .unwrap();
+        assert!(timeout(Duration::from_millis(50), b.recv_from(&mut buffer))
+            .await
+            .is_err());
+        // Separate SRTCP ports also preserve bytes and do not require RTCP mux.
+        let ar = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let br = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rtcp = [0x80, 200, 0, 1, 0, 0, 0, 1, 99, 88, 77, 66];
+        timeout(Duration::from_secs(1), async {
+            let mut got_a = false;
+            let mut got_b = false;
+            while !got_a || !got_b {
+                ar.send_to(&rtcp, ("127.0.0.1", port + 1)).await.unwrap();
+                br.send_to(&rtcp, ("127.0.0.1", port + 3)).await.unwrap();
+                if let Ok(Ok((n, _))) =
+                    timeout(Duration::from_millis(10), ar.recv_from(&mut buffer)).await
+                {
+                    assert_eq!(&buffer[..n], &rtcp);
+                    got_a = true;
+                }
+                if let Ok(Ok((n, _))) =
+                    timeout(Duration::from_millis(10), br.recv_from(&mut buffer)).await
+                {
+                    assert_eq!(&buffer[..n], &rtcp);
+                    got_b = true;
+                }
+            }
+        })
+        .await
+        .expect("RTCP in both directions");
+        process_sip_message(&request("BYE", "1001", ""), caller, caller_tx, &state).await;
+        assert!(!state.router.has_active_call("security-call"));
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if zrtp::bind(port, port + 2).await.is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("BYE releases all four sockets");
     }
 
     fn fixture() -> Arc<ServerState> {

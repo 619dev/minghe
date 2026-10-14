@@ -99,7 +99,7 @@ impl Router {
         }
     }
 
-    /// Explicit compatibility profile: TLS signaling and server-terminated SRTP.
+    /// Explicit media profile: SDES termination or transparent ZRTP relay.
     pub fn with_media(
         mut self,
         media: &crate::config::MediaConfig,
@@ -111,14 +111,17 @@ impl Router {
             media.rtp_port_end,
             media.media_addr.clone(),
         ));
-        self.sdes = Some(super::sdes_router::SdesRouter::new(
-            self.registrar.clone(),
-            manager,
-            self.domain.clone(),
-            media.media_addr.clone(),
-            range_start,
-            range_end,
-        ));
+        self.sdes = Some(
+            super::sdes_router::SdesRouter::new(
+                self.registrar.clone(),
+                manager,
+                self.domain.clone(),
+                media.media_addr.clone(),
+                range_start,
+                range_end,
+            )
+            .with_mode(media.mode),
+        );
         self
     }
 

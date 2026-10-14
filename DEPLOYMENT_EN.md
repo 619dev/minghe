@@ -1,87 +1,114 @@
-# Deployment, migration and release
+# Deployment, upgrades and publishing
 
-[中文](DEPLOYMENT.md) · [Home](README_EN.md) · [E2EE profile](E2EE_EN.md) · [Security record](SECURITY_EN.md)
+[中文](DEPLOYMENT.md) · [Home](README_EN.md) · [ZRTP setup](ZRTP_EN.md) · [Security and validation](SECURITY_EN.md)
 
-## Bria compatibility profile
+## Configuration and profiles
 
-For existing Bria users, keep or restore `[media]`, set a reachable public IPv4 and expose the matching UDP range. Follow [BRIA_EN.md](BRIA_EN.md). This explicitly enables TLS + SDES-SRTP relay, where the server terminates media encryption. The migration instructions below apply to the default E2EE profile without `[media]`.
+For a new installation, copy `config.template.toml` to `config/config.toml` and set host, passwords of at least 12 bytes and individual extension passwords. Edit existing configuration during upgrades; do not replace accounts or certificate settings with the template. The source binary defaults to root `config.toml` without `-c`; commands here and Docker explicitly use `config/config.toml`.
 
-## Migrating to the E2EE profile
+| Profile | Configuration | Networking and endpoints |
+| --- | --- | --- |
+| ZRTP | `[media] mode = "zrtp"` | Public IPv4 and UDP relay; require ZRTP, disable ICE, compare SAS; see [ZRTP_EN.md](ZRTP_EN.md) |
+| Bria SDES | `[media] mode = "sdes"` or mode omitted | Public IPv4 and UDP relay; SDES-SRTP; server can decrypt audio |
+| Signed DTLS | Remove the entire `[media]` table | Adapt clients to [E2EE_EN.md](E2EE_EN.md), with endpoint ICE/STUN and separate TURN if needed |
 
-The E2EE profile is incompatible with unadapted Bria/SDES clients. First integrate SHA-256 Digest `qop=auth`, signed SDP, DTLS-SRTP and JWE MESSAGE on two actual endpoints and independently verify peer bundle fingerprints. The reference helper does not implement dialing or media. Generate and retain user private keys only on endpoints, never in server configuration, images or volumes.
+Profiles are selected at startup, with no automatic fallback. Confirm both clients support the target profile before migration. Back up configuration and TLS certificates; signed DTLS endpoints must also protect identities, pinned fingerprints and replay databases. Restarting loses undelivered in-memory messages.
 
-When selecting E2EE, remove the entire `[media]` section and remove the server relay UDP mapping/firewall rules. Keeping `[media]` selects Bria relay instead. Endpoints configure ICE/STUN and independent TURN that does not terminate DTLS. Never disable certificate verification or accept SDES/plaintext fallback to restore compatibility.
+Example relay configuration; replace the address with the server's real public IPv4 reachable by both endpoints:
 
-Back up server configuration and TLS certificates; protect endpoint identities, pinned fingerprints and durable replay databases. Offline ciphertext queues are memory-only and are lost on restart. Rolling back restores the older security boundary and cannot preserve the current encryption claims.
+```toml
+[media]
+mode = "sdes" # Use "zrtp" for ZRTP endpoints.
+rtp_port_start = 20000
+rtp_port_end = 20020
+media_addr = "203.0.113.10"
+```
 
-## Configuration and startup
+The pool includes its start and excludes its end, allocating even RTP ports. SDES uses two ports per call; ZRTP uses two RTP ports plus two odd RTCP ports and requires even start/end values. Either default relay pool supports five calls. Compose maps UDP `20000-20020`. Keep TOML, Compose, security groups and firewalls consistent when changing ranges. Do not advertise container addresses, `0.0.0.0` or phone addresses.
 
-For a fresh deployment, copy [config.template.toml](config.template.toml) to `config/config.toml`, replace host and all enabled password placeholders. Root [config.toml](config.toml) is another example, not the default deployment path. Use random passwords of at least 12 bytes, preferably distinct for every extension.
+Signed DTLS does not use this server's UDP media ports; remove those mappings if desired. Manage separate TURN ports independently. Do not disable certificate checks or allow plaintext fallback to fix connectivity.
 
-For upgrades, edit the existing deployment configuration; do not overwrite credentials, certificates or `[media]` with the template. Bria media ports default to UDP 20000–20020; this is a Compose mapping, not an environment variable. Custom TOML ranges must also be mapped in Compose and allowed by the firewall.
+## Running from source
 
-Source startup requires Rust 1.88+:
+Requires Rust 1.88+:
 
 ```bash
 mkdir -p config
 cp config.template.toml config/config.toml
 chmod 600 config/config.toml
-# Edit configuration and replace placeholders.
+# Edit placeholders and select a call profile.
 cargo build --release --locked
 ./target/release/minghe -c config/config.toml
 ```
 
-Compose builds `facilisvelox/minghe:latest` from current source:
+## Docker and upgrades
+
+Current Compose contains only `image`, not `build`. Build local source before recreating the container:
 
 ```bash
-docker compose up -d --build
+docker build -t facilisvelox/minghe:latest .
+docker compose up -d --force-recreate
 docker compose logs -f
-docker compose down
 ```
 
-The container uses UID/GID 10001. On Linux, bind-mounted configuration needs directory traversal and file read permissions for this UID; a host-user-owned 0600 file usually cannot be read directly. Grant minimal read access through ownership, a dedicated group or ACL, keeping the mount read-only. External certificates/private keys also need read access; certificate renewal needs a writable certificate directory. The default named volume persists `/app/certs`; do not delete it just to restart.
+To deploy a published image, verify its version first, then pull and start. Pulling after a local build replaces that image:
+
+```bash
+# For published-image deployments only.
+docker compose pull
+docker compose up -d --force-recreate
+```
+
+Pin production image tags or digests to an accepted version. Source validation does not prove remote `latest` contents; this work did not publish the ZRTP changes. `docker compose down` stops services while retaining the certificate volume; do not delete it with `down -v`.
+
+The container runs as UID/GID 10001. Linux bind mount directories must be traversable and configuration plus external certificate/key files readable by that UID. Host-owned 0600 files usually need ownership, a dedicated group or ACL adjustments. Keep configuration mounts read-only. The default `/app/certs` named volume persists certificates and permits renewal writes.
 
 | Compose variable | Default | Purpose |
 | --- | --- | --- |
 | `SIP_PORT` | `5061` | Host TCP port; container target remains 5061 |
-| `RUST_LOG` | `info` | Log level |
-| `TZ` | `Asia/Shanghai` | Time zone |
+| `RUST_LOG` | `info` | Logging level |
+| `TZ` | `Asia/Shanghai` | Timezone |
 | `CPU_LIMIT` | `1.0` | CPU limit |
 | `MEM_LIMIT` | `512M` | Memory limit |
 
-These variables do not replace account, password, host or certificate TOML settings. Changing TOML `sip_port` also requires updating the container target in the port mapping. In the E2EE profile expose SIP/TLS TCP; in the Bria profile also expose the configured UDP media ports; configure independent TURN separately. Health checks confirm process liveness, not registration, peer trust or media operation.
+Environment variables do not replace TOML accounts, passwords, host or certificates. Changing TOML `sip_port` also requires changing the container target mapping. Health checks establish process liveness, not registration or media availability.
 
-Use trusted CA certificates publicly, setting both `cert_path` and `key_path`. Self-signed mode generates `certs/server.crt` and its private key; in Docker these reside in the certificate volume. Safely export only the public certificate for client trust. Update trust after renewal and keep verification enabled. Server certificate trust and endpoint identity trust are separate.
+## TLS and endpoints
 
-## Image builds and publication
+Use a trusted CA certificate publicly and set both `cert_path` and `key_path`. Empty paths generate a self-signed `certs/server.crt`, inside the certificate volume with Docker. Import the public certificate into client trust and update trust after renewal; never distribute the private key. Server TLS trust and peer identity authentication are separate.
 
-[build-and-push.sh](build-and-push.sh) supports Depot and Docker Buildx. **It defaults to `PUSH=1`; a non-latest TAG also updates latest.** Documentation changes and local checks do not require publishing.
+Bria requires SIP/TLS, SHA-256 Digest `qop=auth`, SDES-SRTP and certificate verification. Confirm version support. Both clients must send SRTP to establish NAT return paths; only authenticated SRTP packets update addresses. Supported suites are AES_CM_128_HMAC_SHA1_80 and AEAD_AES_128_GCM. Separate RTCP/SRTCP forwarding is unavailable in this profile. It is not end-to-end encrypted.
+
+ZRTP settings and SAS acceptance are maintained in [ZRTP_EN.md](ZRTP_EN.md). All profiles accept only MingHe JWE MESSAGE, not Bria text chat; signed DTLS and messaging tools are documented in [E2EE_EN.md](E2EE_EN.md).
+
+## Publishing images
+
+[build-and-push.sh](build-and-push.sh) supports Depot and Docker Buildx. Default `PUSH=1` publishes remotely; a non-latest TAG also updates latest. Documentation edits do not require publishing.
 
 ```bash
-# Build and load one local platform without pushing; select your architecture.
+# Local single-platform build/load; no push. Select the deployment architecture.
 PUSH=0 BUILDER=buildx PLATFORM=linux/amd64 TAG=media-review ./build-and-push.sh
 
-# After release validation, push to your own repository; also updates its latest.
+# Publish after acceptance; also updates latest.
 REPO=YOUR_DOCKER_HUB_USER TAG=YOUR_RELEASE_TAG ./build-and-push.sh
 ```
 
-Buildx with `PUSH=0` and multiple platforms only validates the build without loading locally. Depot uses its `--load` behavior. Compose includes `build: .` and `image: facilisvelox/minghe:latest`; `up --build` builds local source and tags the result locally without pushing. To deploy a published tag, explicitly update image/build configuration or use the printed docker run command, retaining container restrictions, read-only configuration and persistent certificates. These source changes have not published an image.
+Buildx multi-platform `PUSH=0` builds do not load local images; Depot uses `--load`. Update Compose image when using a custom repository or tag. Before publishing, run [security checks](SECURITY_EN.md) and accept real endpoints, cross-network calls and container operation.
 
-## Validation and troubleshooting
-
-Before release, run [the security-record commands](SECURITY_EN.md), install endpoint dependencies, perform a fresh Cargo Audit and validate actual clients, bidirectional audio, cross-NAT/TURN connectivity, certificate trust, key-substitution rejection, replay rejection and container execution. The Rust Bria regression sends real bidirectional UDP SRTP packets with AES-CM/GCM endpoints. The separate Python TLS/SIP test checks signaling and encrypted messages without audio. Neither verifies actual cross-NAT Bria calls.
+## Troubleshooting
 
 | Symptom | Check |
 | --- | --- |
-| Configuration rejected | host, password placeholders/length, extension range, paired certificate paths |
-| Container cannot read files | UID 10001 read/traversal permissions and mount locations |
-| Registration fails | TLS trust, SHA-256/qop=auth, credentials, connection binding and source-IP rate limits |
-| Bria call returns 488 | Ensure `[media]` is enabled and both clients offer a supported SDES-SRTP suite; plaintext RTP, DTLS fingerprints and signed E2EE offers are rejected in this profile |
-| E2EE call returns 488 | SDP protocol, RTCP mux, setup, fingerprint, identity envelope and exact signed SDP bytes |
-| Bria connects without audio | Public IPv4 in `media_addr`, matching UDP port range in TOML/Compose/firewall, both endpoints sending SRTP, and first-packet forwarding logs in both directions |
-| E2EE signaling succeeds without audio | Endpoint signature verification, actual DTLS fingerprint, ICE and independent TURN |
-| MESSAGE returns 415 | application/jose restricted five-segment JWE, plaintext or accidental CLI newline |
-| Endpoint rejects message | Pinned fingerprint, GCM/signature, identities, clock and replay state; keep verification enabled |
-| Offline messages vanish on restart | Queues are memory-only; 200 does not acknowledge endpoint decryption |
+| Configuration rejected | Placeholder/short passwords, host, extension range, paired certificate paths, mode and media range |
+| Container cannot read files | UID 10001 read/traverse permissions and mount paths |
+| Registration fails | TLS trust, SHA-256 / qop=auth, credentials and source-IP limits |
+| Bria call returns 488 | SDES profile and supported suites; DTLS fingerprints, signed identity offers and plaintext profiles are rejected |
+| ZRTP call returns 488 | Hello hash, ZRTP 1.10, ICE disabled, audio only, available relay ports |
+| Signed DTLS call returns 488 | Exact SDP bytes, identity envelope, fingerprint, setup and RTCP mux |
+| Relay call connects without audio | Public IPv4, all UDP mappings, firewall, media/Hello from both endpoints and completed ZRTP handshake |
+| Signed DTLS has no audio | Signature checks, actual DTLS fingerprint, ICE candidates and TURN connectivity |
+| MESSAGE returns 415 | application/jose, restricted five-part JWE, CLI newline or incompatible native chat protocol |
+| Client rejects messages | Pinned fingerprint, GCM/signature, identities, clock and replay database |
+| Offline messages lost after restart | Queue is in memory; 200 does not mean successful endpoint decryption |
 
-Share only redacted troubleshooting logs. Do not share passwords, Digest Authorization, endpoint private keys or message plaintext.
+Share redacted logs only: hide passwords, Digest Authorization, SDES keys, endpoint private keys and message plaintext.
