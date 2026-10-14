@@ -4,7 +4,7 @@
 
 鸣鹤支持显式 `mode = "zrtp"` 媒体中继。双方客户端执行 ZRTP 密钥协商和 SRTP/SRTCP 加解密，服务器只原样转发握手及媒体包，不生成或持有这类通话的媒体密钥。中继提供跨 NAT 返回路径，不要求手机具有公网地址。
 
-客户端可使用支持 ZRTP 的 Linphone，见 [官方功能说明](https://www.linphone.org/en/features/)。具体版本必须同时支持本服务的 SIP/TLS、SHA-256 Digest `qop=auth` 和本页 SDP 配置。本次自动化测试没有运行真实 Linphone，不能据此声称任意客户端版本已验收。
+客户端可使用支持 ZRTP 的 Linphone，见 [官方功能说明](https://www.linphone.org/en/features/)。具体版本必须同时支持本服务的 SIP/TLS、所配置的 Digest 算法及 `qop=auth` 和本页 SDP 配置。本次自动化测试没有运行真实 Linphone，不能据此声称任意客户端版本已验收。
 
 ## 服务配置
 
@@ -24,7 +24,7 @@ media_addr = "203.0.113.10" # 换成服务器真实公网 IPv4
 
 ## 双方客户端
 
-1. 配置自己的鸣鹤 SIP 账号、SIP/TLS 和 SHA-256 Digest；验证服务器证书。
+1. 配置自己的鸣鹤 SIP 账号、SIP/TLS 和所配置的 Digest 算法（默认 SHA-256）；验证服务器证书。
 2. 语音加密选择 **ZRTP**，开启强制媒体加密或等效设置，禁止协商失败后继续明文通话。若客户端版本不提供强制 ZRTP，不能将其作为本模式的安全客户端。
 3. 禁用 ICE/STUN/TURN 自动媒体协商，使用 SDP 中服务器中继地址。此中继不是 ICE agent；带 ICE 属性的 SDP 会返回 488。
 4. 仅启用音频，使用双方共有的语音编码，例如 PCMU/PCMA。支持 RTP/AVP 或 RTP/AVPF、ZRTP 1.10，客户端必须在音频 SDP 中提供 `a=zrtp-hash:1.10 <64位十六进制 SHA-256>`。支持 RTCP mux，也提供独立 SRTCP 端口。

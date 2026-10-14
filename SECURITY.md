@@ -19,7 +19,7 @@ ZRTP 的 Hello hash 用于关联媒体来源与 SIP 会话，不替代 SAS，也
 ## 共同保护与媒体限制
 
 - SIP/TLS，客户端验证服务器证书；自签名私钥以 0600 保存，自动续期及 TLS 热重载。
-- SHA-256 Digest `qop=auth`，拒绝 MD5 和缺省算法；nonce 绑定账号和连接，5 分钟有效，递增 nc 防重放。
+- Digest `qop=auth` 默认 SHA-256，拒绝 MD5 和缺省算法；仅 `[server] digest_algorithm = "md5"` 显式启用 MD5，此时允许省略 algorithm（按 MD5 处理）。不自动降级；nonce 绑定账号和连接，5 分钟有效，递增 nc 防重放。
 - 连接先注册，From 与认证身份一致；对话控制绑定原始 TLS 连接和方向，被叫响应检查 CSeq；注册过期或替换使旧身份失效。
 - 拒绝重复关键头部、折行和控制字符；投递及暂存移除 Digest 认证材料，处理伪造 From。
 - 非法早期 SDP 取消被叫侧 INVITE；非法 200 answer 向合法被叫对话发送 ACK/BYE 并清理记录。
@@ -55,7 +55,7 @@ ZRTP 的 Hello hash 用于关联媒体来源与 SIP 会话，不替代 SAS，也
 
 ## 验证范围与复现
 
-当前语音改动通过 122 项 Rust 测试、Release 构建、Clippy、格式与 diff 检查；Clippy 仍有未使用代码及风格警告。Rust 测试实际发送本机 UDP 包，覆盖 Bria 双向 AES-CM/GCM 解密重加密、ZRTP hash 与握手字节转发、两端独立密钥的 SRTP 原样转发及终端解密、RTCP 字节转发、降级/端口失败/早期 hash 变更拒绝和资源释放。
+当前代码通过 124 项 Rust 测试、Release 构建、Clippy、格式与 diff 检查；Clippy 仍有未使用代码及风格警告。Rust 测试实际发送本机 UDP 包，覆盖 Bria 双向 AES-CM/GCM 解密重加密、ZRTP hash 与握手字节转发、两端独立密钥的 SRTP 原样转发及终端解密、RTCP 字节转发、降级/端口失败/早期 hash 变更拒绝和资源释放。
 
 ZRTP Hello 与 RTCP 是构造的测试消息，测试没有执行真实 ZRTP 密钥交换、SAS 或 SRTCP 密码学验证。本次语音改动没有重跑 Python 客户端/TLS 集成测试、容器运行和 Cargo Audit，也没有发布镜像或修改部署配置。真实音频、跨网络互通及客户端强制加密需要另行验收；历史审计结果不能代表当前依赖安全。
 
@@ -78,3 +78,5 @@ cargo audit
 ```
 
 Python 依赖见 `tools/requirements-e2ee.txt`。TLS/SIP 集成测试使用临时身份、证书与配置，只监听 127.0.0.1，验证注册、密文补投、重放拒绝和签名 SDP 路由，不发送语音。协议及工具用法见 [E2EE.md](E2EE.md)。
+
+MD5 兼容认证测试包含标准 Digest 向量、配置默认值、算法隔离、注册、错误密码、连接/身份绑定、qop 要求与重放拒绝。MD5 仅用于 SIP 登录，不用于 ZRTP、DTLS、SRTP 或 JWE；登录认证强度低于 SHA-256，应使用强随机密码并保持 TLS 验证。真实 Bria Mobile 登录仍需部署后验证。

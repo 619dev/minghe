@@ -25,6 +25,9 @@ pub struct AppConfig {
 /// SIP 服务器基本配置
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
+    /// Explicit SIP Digest selection; compatibility is opt-in.
+    #[serde(default)]
+    pub digest_algorithm: DigestAlgorithm,
     /// 监听地址（如 "0.0.0.0"）
     pub listen_addr: String,
     /// SIP TLS 端口（默认 5061）
@@ -33,6 +36,29 @@ pub struct ServerConfig {
     /// 用于 SIP URI 和 TLS 证书生成
     /// 支持域名（如 "minghe.local"）和 IP 地址（如 "192.168.1.100"）
     pub host: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DigestAlgorithm {
+    #[default]
+    Sha256,
+    Md5,
+}
+
+impl DigestAlgorithm {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Sha256 => "SHA-256",
+            Self::Md5 => "MD5",
+        }
+    }
+    pub fn hex_length(self) -> usize {
+        match self {
+            Self::Sha256 => 64,
+            Self::Md5 => 32,
+        }
+    }
 }
 
 impl ServerConfig {
@@ -212,6 +238,31 @@ mod tests {
             std::env::temp_dir().join(format!("minghe-config-{}.toml", uuid::Uuid::new_v4()));
         std::fs::write(&path, &valid).unwrap();
         assert!(AppConfig::load(path.to_str().unwrap()).is_ok());
+        assert_eq!(
+            AppConfig::load(path.to_str().unwrap())
+                .unwrap()
+                .server
+                .digest_algorithm,
+            DigestAlgorithm::Sha256
+        );
+        std::fs::write(
+            &path,
+            valid.replace("[server]", "[server]\ndigest_algorithm = 'md5'"),
+        )
+        .unwrap();
+        assert_eq!(
+            AppConfig::load(path.to_str().unwrap())
+                .unwrap()
+                .server
+                .digest_algorithm,
+            DigestAlgorithm::Md5
+        );
+        std::fs::write(
+            &path,
+            valid.replace("[server]", "[server]\ndigest_algorithm = 'automatic'"),
+        )
+        .unwrap();
+        assert!(AppConfig::load(path.to_str().unwrap()).is_err());
         // Media configuration explicitly selects compatibility mode.
         std::fs::write(
             &path,

@@ -80,13 +80,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // 创建注册服务（含 Digest 认证）
-    let registrar = Arc::new(sip::registrar::RegistrarService::new(
-        config.server.host.clone(),
-        config.extensions.default_password.clone(),
-        config.passwords.clone(),
-        config.extensions.range_start,
-        config.extensions.range_end,
-    ));
+    let registrar = Arc::new(
+        sip::registrar::RegistrarService::new(
+            config.server.host.clone(),
+            config.extensions.default_password.clone(),
+            config.passwords.clone(),
+            config.extensions.range_start,
+            config.extensions.range_end,
+        )
+        .with_digest_algorithm(config.server.digest_algorithm),
+    );
 
     // 启动注册清理后台任务
     registrar.start_cleanup_task();

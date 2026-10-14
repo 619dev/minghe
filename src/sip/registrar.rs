@@ -10,6 +10,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use super::parser;
+use crate::config::DigestAlgorithm;
 
 /// 注册条目，记录分机的注册信息
 #[derive(Debug, Clone)]
@@ -50,6 +51,7 @@ pub struct RegistrarService {
     challenges: RwLock<HashMap<String, (SocketAddr, String, Instant, u32)>>,
     /// 服务器域名或 IP（用于 Digest realm）
     domain: String,
+    digest_algorithm: DigestAlgorithm,
     /// 所有分机的默认密码
     default_password: String,
     /// 分机独立密码（分机号 -> 密码）
@@ -76,11 +78,24 @@ impl RegistrarService {
             attempts: RwLock::new(HashMap::new()),
             challenges: RwLock::new(HashMap::new()),
             domain,
+            digest_algorithm: DigestAlgorithm::Sha256,
             default_password,
             passwords,
             range_start,
             range_end,
         }
+    }
+
+    pub fn with_digest_algorithm(mut self, algorithm: DigestAlgorithm) -> Self {
+        self.digest_algorithm = algorithm;
+        if algorithm == DigestAlgorithm::Md5 {
+            tracing::warn!(
+                "已显式启用 MD5 SIP Digest 兼容认证（仅 TLS）；弱于 SHA-256，媒体加密模式独立配置"
+            );
+        } else {
+            tracing::info!("SIP Digest 认证算法: SHA-256");
+        }
+        self
     }
 
     /// 获取指定分机的密码
@@ -160,7 +175,7 @@ impl RegistrarService {
             None => self.challenge_response(request_text, from_addr, &extension, false),
             Some(auth_value) => {
                 // 解析并验证 Digest 认证
-                let params = match parse_authorization_checked(&auth_value) {
+                let params = match parse_authorization_for(&auth_value, self.digest_algorithm) {
                     Ok(p) => p,
                     Err(reason) => {
                         tracing::warn!(peer = %from_addr, reason, "REGISTER Digest 认证参数被拒绝（不记录凭据）");
@@ -207,7 +222,8 @@ impl RegistrarService {
                     _ => return parser::build_response(request_text, 403, "Forbidden"),
                 };
                 let password = self.get_password(&extension);
-                if !validate_digest(
+                if !validate_digest_for(
+                    self.digest_algorithm,
                     &params.username,
                     &params.realm,
                     password,
@@ -292,16 +308,17 @@ impl RegistrarService {
         }
         tracing::info!(peer = %peer,
             reason = if stale { "unknown or expired nonce" } else { "Authorization header absent" },
-            algorithm = "SHA-256", qop = "auth", "REGISTER 401 认证挑战原因");
+            algorithm = self.digest_algorithm.name(), qop = "auth", "REGISTER 401 认证挑战原因");
         let nonce = generate_nonce();
         challenges.insert(
             nonce.clone(),
             (peer, extension.to_string(), Instant::now(), 0),
         );
         let header = format!(
-            "Digest realm=\"{}\", nonce=\"{}\", algorithm=SHA-256, qop=\"auth\"{}",
+            "Digest realm=\"{}\", nonce=\"{}\", algorithm={}, qop=\"auth\"{}",
             self.domain,
             nonce,
+            self.digest_algorithm.name(),
             if stale { ", stale=true" } else { "" }
         );
         parser::build_response_with_headers(
@@ -416,7 +433,15 @@ fn parse_authorization(header_value: &str) -> Option<DigestParams> {
 }
 
 /// Return only fixed diagnostic labels; never include attacker-provided credentials.
+#[cfg(test)]
 fn parse_authorization_checked(header_value: &str) -> Result<DigestParams, &'static str> {
+    parse_authorization_for(header_value, DigestAlgorithm::Sha256)
+}
+
+fn parse_authorization_for(
+    header_value: &str,
+    algorithm: DigestAlgorithm,
+) -> Result<DigestParams, &'static str> {
     let value = header_value.trim();
     let value = value
         .strip_prefix("Digest ")
@@ -452,7 +477,10 @@ fn parse_authorization_checked(header_value: &str) -> Result<DigestParams, &'sta
                 "qop" => qop = Some(val),
                 "nc" => nc = Some(val),
                 "cnonce" => cnonce = Some(val),
-                "algorithm" if !val.eq_ignore_ascii_case("SHA-256") => {
+                "algorithm" if !val.eq_ignore_ascii_case(algorithm.name()) => {
+                    if algorithm == DigestAlgorithm::Md5 {
+                        return Err("client algorithm differs from configured MD5 profile");
+                    }
                     return Err(if val.eq_ignore_ascii_case("MD5") {
                         "client selected MD5; server requires SHA-256"
                     } else {
@@ -464,13 +492,17 @@ fn parse_authorization_checked(header_value: &str) -> Result<DigestParams, &'sta
         }
     }
 
-    if !seen.contains("algorithm") {
+    if algorithm == DigestAlgorithm::Sha256 && !seen.contains("algorithm") {
         return Err("missing Digest algorithm; server requires explicit SHA-256");
     }
     if username.is_empty() || realm.is_empty() || nonce.is_empty() || uri.is_empty() {
         return Err("missing required Digest identity/challenge parameter");
     }
-    if response.len() != 64 || !response.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if response.len() != algorithm.hex_length() || !response.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        if algorithm == DigestAlgorithm::Md5 {
+            return Err("invalid MD5 Digest response; requires 32 hex digits");
+        }
         return Err(match response.len() {
             0 => "empty Digest response; SHA-256 requires 64 hex digits",
             32 => "32-character Digest response; SHA-256 requires 64 hex digits",
@@ -526,6 +558,7 @@ fn split_digest_params(input: &str) -> Vec<String> {
 /// HA1 = SHA-256(username:realm:password)
 /// HA2 = SHA-256(method:uri)
 /// ```
+#[cfg(test)]
 fn validate_digest(
     username: &str,
     realm: &str,
@@ -538,8 +571,36 @@ fn validate_digest(
     nc: Option<&str>,
     cnonce: Option<&str>,
 ) -> bool {
-    let ha1 = sha256_hex(&format!("{}:{}:{}", username, realm, password));
-    let ha2 = sha256_hex(&format!("{}:{}", method, uri));
+    validate_digest_for(
+        DigestAlgorithm::Sha256,
+        username,
+        realm,
+        password,
+        nonce,
+        uri,
+        method,
+        response,
+        qop,
+        nc,
+        cnonce,
+    )
+}
+
+fn validate_digest_for(
+    algorithm: DigestAlgorithm,
+    username: &str,
+    realm: &str,
+    password: &str,
+    nonce: &str,
+    uri: &str,
+    method: &str,
+    response: &str,
+    qop: Option<&str>,
+    nc: Option<&str>,
+    cnonce: Option<&str>,
+) -> bool {
+    let ha1 = digest_hex(algorithm, &format!("{}:{}:{}", username, realm, password));
+    let ha2 = digest_hex(algorithm, &format!("{}:{}", method, uri));
 
     let (nc, cnonce) = match (qop, nc, cnonce) {
         (Some("auth"), Some(nc), Some(cnonce))
@@ -552,13 +613,26 @@ fn validate_digest(
         _ => return false,
     };
     // RFC 8760 / RFC 7616 qop=auth; missing replay fields never get defaults.
-    let expected = sha256_hex(&format!("{}:{}:{}:{}:auth:{}", ha1, nonce, nc, cnonce, ha2));
+    let expected = digest_hex(
+        algorithm,
+        &format!("{}:{}:{}:{}:auth:{}", ha1, nonce, nc, cnonce, ha2),
+    );
 
     use subtle::ConstantTimeEq;
     expected
         .as_bytes()
         .ct_eq(response.to_ascii_lowercase().as_bytes())
         .into()
+}
+
+fn digest_hex(algorithm: DigestAlgorithm, input: &str) -> String {
+    match algorithm {
+        DigestAlgorithm::Sha256 => sha256_hex(input),
+        DigestAlgorithm::Md5 => {
+            use md5::{Digest, Md5};
+            hex::encode(Md5::digest(input.as_bytes()))
+        }
+    }
 }
 
 /// 计算 SHA-256 哈希并返回小写十六进制字符串
@@ -671,6 +745,117 @@ mod tests {
             "missing Digest algorithm; server requires explicit SHA-256"
         );
         assert!(!error.contains(secret));
+    }
+
+    #[test]
+    fn md5_matches_rfc2617_vector_and_requires_replay_fields() {
+        let check = |response, qop, nc, cnonce| {
+            validate_digest_for(
+                DigestAlgorithm::Md5,
+                "Mufasa",
+                "testrealm@host.com",
+                "Circle Of Life",
+                "dcd98b7102dd2f0e8b11d0f600bfb0c093",
+                "/dir/index.html",
+                "GET",
+                response,
+                qop,
+                nc,
+                cnonce,
+            )
+        };
+        assert!(check(
+            "6629fae49393a05397450978507c4ef1",
+            Some("auth"),
+            Some("00000001"),
+            Some("0a4f113b")
+        ));
+        assert!(!check("6629fae49393a05397450978507c4ef1", None, None, None));
+        assert!(!check(
+            "6629fae49393a05397450978507c4ef1",
+            Some("auth"),
+            Some("00000000"),
+            Some("0a4f113b")
+        ));
+    }
+
+    #[test]
+    fn md5_is_explicit_registers_and_keeps_binding_and_replay_checks() {
+        let svc = RegistrarService::new(
+            "example.com".into(),
+            "secret".into(),
+            HashMap::new(),
+            1000,
+            2000,
+        )
+        .with_digest_algorithm(DigestAlgorithm::Md5);
+        let peer = "127.0.0.1:1234".parse().unwrap();
+        let challenge = String::from_utf8(svc.handle_register(&request("", "1001"), peer)).unwrap();
+        assert!(challenge.contains("algorithm=MD5") && challenge.contains("qop=\"auth\""));
+        assert!(!challenge.contains("SHA-256"));
+        let nonce = svc
+            .challenges
+            .read()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        // Compute independently with the MD5 library, not the validation helper.
+        use md5::{Digest, Md5};
+        let hash = |s: &str| hex::encode(Md5::digest(s.as_bytes()));
+        let ha1 = hash("1001:example.com:secret");
+        let ha2 = hash("REGISTER:sip:example.com");
+        let response = hash(&format!("{ha1}:{nonce}:00000001:client:auth:{ha2}"));
+        let auth = format!("Authorization: Digest username=\"1001\", realm=\"example.com\", nonce=\"{nonce}\", uri=\"sip:example.com\", response=\"{response}\", algorithm=MD5, qop=auth, nc=00000001, cnonce=\"client\"\r\n");
+        assert!(
+            parse_authorization_checked(auth.strip_prefix("Authorization: ").unwrap()).is_err()
+        );
+        assert!(parse_authorization_for(
+            auth.strip_prefix("Authorization: ").unwrap(),
+            DigestAlgorithm::Md5
+        )
+        .is_ok());
+        assert!(parse_authorization_for(
+            &auth
+                .strip_prefix("Authorization: ")
+                .unwrap()
+                .replace("algorithm=MD5", "algorithm=SHA-256"),
+            DigestAlgorithm::Md5
+        )
+        .is_err());
+        let status = |req: &str, addr| {
+            parser::extract_status_code(
+                std::str::from_utf8(&svc.handle_register(req, addr)).unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            status(&request(&auth, "1001"), "127.0.0.1:1235".parse().unwrap()),
+            403
+        );
+        assert_eq!(status(&request(&auth, "1002"), peer), 403);
+        assert_eq!(
+            status(
+                &request(&auth.replace(&response, &"0".repeat(32)), "1001"),
+                peer
+            ),
+            403
+        );
+        assert_eq!(
+            status(&request(&auth.replace(", qop=auth", ""), "1001"), peer),
+            403
+        );
+        // RFC default algorithm omission is accepted only in explicit MD5 mode.
+        let legacy = auth.replace(", algorithm=MD5", "");
+        assert!(
+            parse_authorization_checked(legacy.strip_prefix("Authorization: ").unwrap()).is_err()
+        );
+        assert_eq!(status(&request(&legacy, "1001"), peer), 200);
+        assert_eq!(status(&request(&legacy, "1001"), peer), 403);
+        svc.disconnect(peer);
+        assert!(!svc.is_registered("1001"));
+        assert!(svc.challenges.read().unwrap().is_empty());
     }
 
     #[test]

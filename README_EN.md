@@ -9,12 +9,12 @@ A Rust SIP/TLS voice service with an opaque ZRTP relay, a Bria-compatible SDES-S
 | Configuration | Endpoint requirements | Media path and encryption boundary |
 | --- | --- | --- |
 | `[media] mode = "zrtp"` | ZRTP 1.10 and Hello hashes; mandatory encryption, ICE disabled, SAS comparison | Server forwards ZRTP / SRTP / SRTCP unchanged; endpoints hold media keys |
-| `[media] mode = "sdes"`, or `[media]` with mode omitted | SIP/TLS, SHA-256 Digest and SDES-SRTP, such as compatible Bria versions | Server decrypts and re-encrypts audio; not end-to-end encrypted |
+| `[media] mode = "sdes"`, or `[media]` with mode omitted | SIP/TLS, configured Digest authentication and SDES-SRTP, such as compatible Bria versions | Server decrypts and re-encrypts audio; not end-to-end encrypted |
 | No `[media]` | MingHe signed SDP, peer identity verification and DTLS-SRTP | SDP forwarded unchanged; endpoints connect using ICE and a separate TURN relay if needed |
 
 The profile is selected at startup and never falls back automatically. Both endpoints must support the selected profile. Omitting `[media]` requires adapted clients; ordinary softphones do not automatically implement signed SDP.
 
-Every profile requires TLS certificate verification and SHA-256 Digest `qop=auth`. MESSAGE accepts only MingHe JWE ciphertext, not ordinary SIP text. A ZRTP client's native encrypted chat protocol is not automatically compatible with MingHe JWE.
+Every profile requires TLS certificate verification and Digest `qop=auth` (SHA-256 by default; MD5 compatibility is explicit, see [deployment](DEPLOYMENT_EN.md)). MESSAGE accepts only MingHe JWE ciphertext, not ordinary SIP text. A ZRTP client's native encrypted chat protocol is not automatically compatible with MingHe JWE.
 
 ## Quick start
 
@@ -53,7 +53,7 @@ On Linux, grant container UID 10001 read access to configuration. See [deploymen
 
 ## Features and limitations
 
-- TLS signaling, SHA-256 registration, connection and dialog ownership checks, bounded queues, rates and timeouts.
+- TLS signaling, configurable Digest registration, connection and dialog ownership checks, bounded queues, rates and timeouts.
 - ZRTP Hello hashes associate media sources with call legs; UDP addresses are pinned. RTCP mux and separate RTCP ports are supported. Endpoints enforce encryption and verify media authentication tags.
 - SDES relay supports AES-CM / AES-GCM and learns NAT addresses only from authenticated SRTP packets.
 - Signed DTLS preserves SDP and identity envelopes; receiving clients independently verify signatures and actual DTLS fingerprints.
@@ -62,7 +62,7 @@ On Linux, grant container UID 10001 read access to configuration. See [deploymen
 
 Supports REGISTER, INVITE, ACK, BYE, CANCEL, OPTIONS and MESSAGE with one active audio stream. Initial INVITE requires SDP. Video, offerless calls, re-INVITE and media negotiation in ACK are unsupported. ZRTP network address changes require a new call.
 
-The default media pool supports five relay calls. See [SECURITY_EN.md](SECURITY_EN.md) for other limits and security boundaries. 122 Rust tests passed, including bidirectional Bria SRTP and opaque ZRTP forwarding; no real ZRTP endpoint handshake was performed. Real audio, SAS and cross-network interoperability still require deployment acceptance.
+The default media pool supports five relay calls. See [SECURITY_EN.md](SECURITY_EN.md) for other limits and security boundaries. 124 Rust tests passed, including bidirectional Bria SRTP and opaque ZRTP forwarding; no real ZRTP endpoint handshake was performed. Real audio, SAS and cross-network interoperability still require deployment acceptance.
 
 ## Documentation and development
 

@@ -28,6 +28,20 @@ The pool includes its start and excludes its end, allocating even RTP ports. SDE
 
 Signed DTLS does not use this server's UDP media ports; remove those mappings if desired. Manage separate TURN ports independently. Do not disable certificate checks or allow plaintext fallback to fix connectivity.
 
+## Bria Digest compatibility
+
+For clients unable to answer SHA-256 challenges, add this to the existing `[server]` table:
+
+```toml
+[server]
+digest_algorithm = "md5"
+# Keep existing listen_addr, sip_port and host.
+```
+
+Omission or `"sha256"` selects the default SHA-256 profile. `"md5"` explicitly selects MD5 challenges, without multiple algorithms or automatic downgrade. TLS, `qop=auth`, cnonce, increasing nc and connection binding remain required. MD5 clients may omit algorithm, interpreted as MD5. This server-wide setting affects all extensions and is weaker than SHA-256; use strong random passwords and verify TLS certificates.
+
+Rebuild/restart and confirm the explicit MD5 startup log. Successful registration is an initial 401, a retry with Authorization and server 200. This does not change `[media]`: Bria audio still uses SDES; ZRTP/signed DTLS media and JWE messaging remain unchanged.
+
 ## Running from source
 
 Requires Rust 1.88+:
@@ -77,7 +91,7 @@ Environment variables do not replace TOML accounts, passwords, host or certifica
 
 Use a trusted CA certificate publicly and set both `cert_path` and `key_path`. Empty paths generate a self-signed `certs/server.crt`, inside the certificate volume with Docker. Import the public certificate into client trust and update trust after renewal; never distribute the private key. Server TLS trust and peer identity authentication are separate.
 
-Bria requires SIP/TLS, SHA-256 Digest `qop=auth`, SDES-SRTP and certificate verification. Confirm version support. Both clients must send SRTP to establish NAT return paths; only authenticated SRTP packets update addresses. Supported suites are AES_CM_128_HMAC_SHA1_80 and AEAD_AES_128_GCM. Separate RTCP/SRTCP forwarding is unavailable in this profile. It is not end-to-end encrypted.
+Bria requires SIP/TLS, Digest `qop=auth` matching the server configuration, SDES-SRTP and certificate verification. Confirm version support. Both clients must send SRTP to establish NAT return paths; only authenticated SRTP packets update addresses. Supported suites are AES_CM_128_HMAC_SHA1_80 and AEAD_AES_128_GCM. Separate RTCP/SRTCP forwarding is unavailable in this profile. It is not end-to-end encrypted.
 
 ZRTP settings and SAS acceptance are maintained in [ZRTP_EN.md](ZRTP_EN.md). All profiles accept only MingHe JWE MESSAGE, not Bria text chat; signed DTLS and messaging tools are documented in [E2EE_EN.md](E2EE_EN.md).
 
@@ -101,7 +115,7 @@ Buildx multi-platform `PUSH=0` builds do not load local images; Depot uses `--lo
 | --- | --- |
 | Configuration rejected | Placeholder/short passwords, host, extension range, paired certificate paths, mode and media range |
 | Container cannot read files | UID 10001 read/traverse permissions and mount paths |
-| Registration fails | TLS trust, SHA-256 / qop=auth, credentials and source-IP limits |
+| Registration fails | TLS trust, digest_algorithm / qop=auth, credentials and source-IP limits |
 | Bria call returns 488 | SDES profile and supported suites; DTLS fingerprints, signed identity offers and plaintext profiles are rejected |
 | ZRTP call returns 488 | Hello hash, ZRTP 1.10, ICE disabled, audio only, available relay ports |
 | Signed DTLS call returns 488 | Exact SDP bytes, identity envelope, fingerprint, setup and RTCP mux |

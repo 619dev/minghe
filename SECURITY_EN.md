@@ -19,7 +19,7 @@ MESSAGE in every profile accepts only restricted RSA-OAEP-256 / AES-256-GCM JWE.
 ## Shared protections and media restrictions
 
 - SIP/TLS with client certificate verification; self-signed keys use 0600 permissions, automatic renewal and TLS reload.
-- SHA-256 Digest `qop=auth`; MD5 and omitted algorithms rejected. Nonces bind accounts/connections, expire in five minutes and require increasing nc values.
+- Digest `qop=auth` defaults to SHA-256 and rejects MD5/omitted algorithms. Only explicit `[server] digest_algorithm = "md5"` enables MD5; algorithm omission then means MD5. No automatic downgrade. Nonces bind accounts/connections, expire in five minutes and require increasing nc values.
 - Register before use; From matches authenticated identity. Dialog actions bind original TLS channels and direction, responses check CSeq, and expired/replaced registrations revoke old identities.
 - Duplicate critical headers, folded headers and control characters rejected; Digest credentials removed before delivery/queueing; forged From handled.
 - Invalid early SDP cancels the outbound INVITE; invalid 200 answers trigger ACK/BYE for valid peer dialogs and cleanup.
@@ -55,7 +55,7 @@ Separate TURN must not terminate DTLS. Malicious same-IP sources or attackers ob
 
 ## Validation and reproduction
 
-The current voice changes passed 122 Rust tests, Release build, Clippy, formatting and diff checks. Existing unused-code/style warnings remain. Tests send actual local UDP packets: bidirectional Bria AES-CM/GCM decrypt/re-encrypt; ZRTP hashes and handshake byte forwarding; unchanged SRTP forwarding with independent endpoint keys and endpoint decryption; RTCP byte forwarding; downgrade, bind-failure and early hash-change rejection; resource cleanup.
+The current code passed 124 Rust tests, Release build, Clippy, formatting and diff checks. Existing unused-code/style warnings remain. Tests send actual local UDP packets: bidirectional Bria AES-CM/GCM decrypt/re-encrypt; ZRTP hashes and handshake byte forwarding; unchanged SRTP forwarding with independent endpoint keys and endpoint decryption; RTCP byte forwarding; downgrade, bind-failure and early hash-change rejection; resource cleanup.
 
 ZRTP Hello and RTCP packets are constructed fixtures. Tests do not perform a real ZRTP key exchange, SAS check or cryptographic SRTCP verification. The voice changes did not rerun Python client/TLS tests, container operation or Cargo Audit, publish images or modify deployment configuration. Real audio, cross-network interoperability and mandatory endpoint encryption need acceptance. Historical audits do not establish current dependency safety.
 
@@ -78,3 +78,5 @@ cargo audit
 ```
 
 Dependencies are in `tools/requirements-e2ee.txt`. TLS/SIP integration uses temporary identities, certificates and configuration on 127.0.0.1 to check registration, offline ciphertext delivery, replay rejection and signed SDP routing; it sends no audio. See [E2EE_EN.md](E2EE_EN.md) for protocol and tool usage.
+
+MD5 compatibility tests cover the standard Digest vector, configuration defaults, algorithm isolation, registration, wrong passwords, connection/identity binding, required qop and replay rejection. MD5 is used only for SIP login, not ZRTP, DTLS, SRTP or JWE. Authentication is weaker than SHA-256; use strong random passwords and keep TLS verification enabled. Real Bria Mobile registration still requires deployment acceptance.

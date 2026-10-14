@@ -28,6 +28,20 @@ media_addr = "203.0.113.10"
 
 签名 DTLS 模式不使用本服务的 UDP 媒体端口，可移除这部分映射；独立 TURN 的端口单独管理。不要以关闭证书验证或启用明文回退解决连接失败。
 
+## Bria Digest 兼容认证
+
+客户端无法回应 SHA-256 挑战时，在现有 `[server]` 表内加入：
+
+```toml
+[server]
+digest_algorithm = "md5"
+# 保留现有 listen_addr、sip_port 和 host。
+```
+
+省略此字段或设为 `"sha256"` 使用默认 SHA-256。`"md5"` 仅显式选择 MD5 挑战，不同时提供多个算法，也不自动降级。仍要求 TLS、`qop=auth`、cnonce、递增 nc 和连接绑定；MD5 客户端可以省略 algorithm，按 MD5 处理。该设置对服务端全部分机生效，弱于 SHA-256，需要强随机密码及 TLS 证书验证。
+
+更改后重建并重启服务，启动日志应出现“已显式启用 MD5 SIP Digest 兼容认证”。成功流程为首次 401 挑战、客户端带 Authorization 重试、服务端 200。该设置不改变 `[media]`：Bria 语音仍使用 SDES 模式；ZRTP 或签名 DTLS 的媒体和 JWE 消息机制不变。
+
 ## 源码运行
 
 需要 Rust 1.88+：
@@ -77,7 +91,7 @@ docker compose up -d --force-recreate
 
 公网使用受信任 CA 证书，`cert_path` 和 `key_path` 同时设置。留空时生成自签名证书 `certs/server.crt`；Docker 中位于证书卷。将公有证书导入客户端信任，续期后更新信任；私钥不得分发。服务器 TLS 信任和通话对方身份验证是独立步骤。
 
-Bria 使用 SIP/TLS、SHA-256 Digest `qop=auth`，启用 SDES-SRTP 并验证服务器证书。确认版本支持这些功能。两端主动发送 SRTP 才能建立 NAT 返回路径；服务端仅从认证成功的 SRTP 包学习地址。支持 AES_CM_128_HMAC_SHA1_80 与 AEAD_AES_128_GCM，不提供独立 RTCP/SRTCP 转发。此模式不是端到端加密。
+Bria 使用 SIP/TLS、与服务端配置一致的 Digest `qop=auth`，启用 SDES-SRTP 并验证服务器证书。确认版本支持这些功能。两端主动发送 SRTP 才能建立 NAT 返回路径；服务端仅从认证成功的 SRTP 包学习地址。支持 AES_CM_128_HMAC_SHA1_80 与 AEAD_AES_128_GCM，不提供独立 RTCP/SRTCP 转发。此模式不是端到端加密。
 
 ZRTP 的客户端设置和 SAS 验收集中在 [ZRTP.md](ZRTP.md)。所有模式只接受鸣鹤 JWE MESSAGE，不支持 Bria 普通文本消息；签名 DTLS 与消息工具集中在 [E2EE.md](E2EE.md)。
 
@@ -101,7 +115,7 @@ Buildx 的 `PUSH=0` 多平台构建不加载本地镜像；Depot 使用 `--load`
 | --- | --- |
 | 配置启动失败 | 密码占位值及长度、host、分机范围、成对证书路径、mode 及媒体端口范围 |
 | 容器无法读配置或证书 | UID 10001 的读取/目录遍历权限和挂载路径 |
-| 注册失败 | TLS 信任、SHA-256 / qop=auth、账号密码及来源 IP 限流 |
+| 注册失败 | TLS 信任、digest_algorithm / qop=auth、账号密码及来源 IP 限流 |
 | Bria 呼叫 488 | SDES 模式及支持的套件；拒绝 DTLS 指纹、签名身份 offer 和明文协议 |
 | ZRTP 呼叫 488 | Hello hash、ZRTP 1.10、禁用 ICE、仅音频；中继端口是否可绑定 |
 | 签名 DTLS 呼叫 488 | 原始 SDP 字节、身份封装、fingerprint、setup、RTCP mux |

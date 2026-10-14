@@ -4,7 +4,7 @@
 
 With explicit `mode = "zrtp"`, endpoints perform ZRTP key agreement and SRTP/SRTCP encryption/decryption. The server forwards handshake and media packets unchanged without generating or holding media keys. The symmetric relay provides NAT return paths without requiring public phone addresses.
 
-Linphone supports ZRTP; see its [official feature list](https://www.linphone.org/en/features/). The selected version must also support SIP/TLS, SHA-256 Digest `qop=auth` and the SDP requirements below. Automated tests did not run real Linphone endpoints and do not establish compatibility with every version.
+Linphone supports ZRTP; see its [official feature list](https://www.linphone.org/en/features/). The selected version must also support SIP/TLS, configured Digest authentication with `qop=auth` and the SDP requirements below. Automated tests did not run real Linphone endpoints and do not establish compatibility with every version.
 
 ## Server configuration
 
@@ -24,7 +24,7 @@ Builds, Docker commands, port mappings and upgrades are maintained in [DEPLOYMEN
 
 ## Both endpoints
 
-1. Configure each MingHe SIP account, SIP/TLS and SHA-256 Digest; verify the server certificate.
+1. Configure each MingHe SIP account, SIP/TLS and configured Digest authentication (SHA-256 by default); verify the server certificate.
 2. Select **ZRTP** and require media encryption. Do not allow plaintext after negotiation failure. A client without mandatory ZRTP support is unsuitable for this security profile.
 3. Disable ICE/STUN/TURN media negotiation and use the SDP relay address. This symmetric relay is not an ICE agent; SDP with ICE attributes receives 488.
 4. Enable audio only and a shared codec such as PCMU/PCMA. Use RTP/AVP or RTP/AVPF, ZRTP 1.10, with media-level `a=zrtp-hash:1.10 <64 hexadecimal SHA-256 digits>`. RTCP mux and separate SRTCP ports are supported.

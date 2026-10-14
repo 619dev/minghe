@@ -9,12 +9,12 @@ Rust SIP/TLS 语音服务，支持 ZRTP 密文中继、Bria SDES-SRTP 兼容中�
 | 配置 | 客户端要求 | 媒体路径与加密边界 |
 | --- | --- | --- |
 | `[media] mode = "zrtp"` | 支持 ZRTP 1.10、Hello hash，强制加密、禁用 ICE，双方核对 SAS | 服务器原样转发 ZRTP / SRTP / SRTCP；媒体密钥由终端持有 |
-| `[media] mode = "sdes"`，或 `[media]` 不设置 mode | 支持 SIP/TLS、SHA-256 Digest 和 SDES-SRTP，例如兼容版本的 Bria | 服务器解密并重加密语音；不是端到端加密 |
+| `[media] mode = "sdes"`，或 `[media]` 不设置 mode | 支持 SIP/TLS、所配置的 Digest 算法和 SDES-SRTP，例如兼容版本的 Bria | 服务器解密并重加密语音；不是端到端加密 |
 | 不设置 `[media]` | 实现鸣鹤签名 SDP、对方身份验证及 DTLS-SRTP | 服务器原样转发 SDP；媒体由端点通过 ICE / 必要的独立 TURN 建立连接 |
 
 模式在服务启动时确定，不自动回退。双方必须使用同一模式兼容的客户端。没有 `[media]` 并不意味着普通软电话可以直接使用：签名 DTLS 模式需要客户端适配。
 
-所有模式都要求 SIP/TLS 证书验证及 SHA-256 Digest `qop=auth`，只接受 JWE MESSAGE，不兼容普通 SIP 文本消息。ZRTP 客户端的原生聊天加密协议也不会自动兼容鸣鹤 JWE。
+所有模式都要求 SIP/TLS 证书验证及 Digest `qop=auth`（默认 SHA-256；MD5 兼容需显式配置，见 [部署指南](DEPLOYMENT.md)），只接受 JWE MESSAGE，不兼容普通 SIP 文本消息。ZRTP 客户端的原生聊天加密协议也不会自动兼容鸣鹤 JWE。
 
 ## 快速开始
 
@@ -53,7 +53,7 @@ Linux 上需授权容器 UID 10001 读取配置；UDP 映射、证书、升级�
 
 ## 功能与限制
 
-- TLS 信令、SHA-256 注册认证、连接及对话归属校验，有界队列、速率与超时限制。
+- TLS 信令、可配置的 Digest 注册认证、连接及对话归属校验，有界队列、速率与超时限制。
 - ZRTP 使用 Hello hash 关联媒体来源、固定 UDP 地址；支持 RTCP mux 和独立 RTCP 端口。服务器不验证 SRTP 认证标签，强制加密由终端执行。
 - SDES 兼容中继支持 AES-CM / AES-GCM，只有认证成功的 SRTP 包可以更新 NAT 地址。
 - 签名 DTLS 模式保持 SDP 和身份封装原样；接收端必须独立验签并核对实际 DTLS 指纹。
@@ -62,7 +62,7 @@ Linux 上需授权容器 UID 10001 读取配置；UDP 映射、证书、升级�
 
 支持 REGISTER、INVITE、ACK、BYE、CANCEL、OPTIONS、MESSAGE，仅单个活动音频流。初始 INVITE 必须携带 SDP；不支持视频、offerless、re-INVITE 或 ACK 中协商媒体。ZRTP 通话中改变网络地址需挂断重拨。
 
-默认媒体端口池最多五通中继呼叫；其他容量和安全边界统一见 [SECURITY.md](SECURITY.md)。122 项 Rust 测试已通过，包括 Bria 双向 SRTP 和 ZRTP 透明转发；测试没有执行真实 ZRTP 客户端握手。真实双向声音、SAS 及跨网络互通仍需部署验收。
+默认媒体端口池最多五通中继呼叫；其他容量和安全边界统一见 [SECURITY.md](SECURITY.md)。124 项 Rust 测试已通过，包括 Bria 双向 SRTP 和 ZRTP 透明转发；测试没有执行真实 ZRTP 客户端握手。真实双向声音、SAS 及跨网络互通仍需部署验收。
 
 ## 文档与开发
 

@@ -23,6 +23,8 @@ base64 = "0.22"
 hex = "0.4"
 subtle = "2"
 ring = "0.17"
+# Explicit legacy SIP Digest profile; never used for media encryption.
+md-5 = "0.10"
 
 # Serialization & config
 serde = { version = "1", features = ["derive"] }
