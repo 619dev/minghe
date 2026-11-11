@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -40,6 +40,7 @@ pub struct ServerState {
     bark_subscriptions: Arc<BarkSubscriptions>,
     /// 连接映射：peer_addr -> ConnectionState
     connections: RwLock<HashMap<SocketAddr, ConnectionState>>,
+    registration_updates: Mutex<()>,
 }
 
 impl ServerState {
@@ -144,6 +145,7 @@ pub async fn run(
                 .unwrap_or_else(|| std::path::PathBuf::from("certs/bark-subscriptions.json")),
         )?),
         connections: RwLock::new(HashMap::new()),
+        registration_updates: Mutex::new(()),
     });
 
     let bind_addr = format!("{}:{}", config.server.listen_addr, config.server.sip_port);
@@ -314,14 +316,17 @@ async fn handle_connection(
     state.router.cleanup_disconnected(&writer_tx);
     state.bark.disconnect(&writer_tx);
     // 连接断开，清理
-    let extension = state.remove_connection(&peer_addr);
-    state.registrar.disconnect(peer_addr);
-    if let Some(ext) = &extension {
-        tracing::info!("分机 {} 断开连接", ext);
-        if let Some(writer) = state.find_writer_by_extension(ext) {
-            state.router.register_writer(ext, writer);
-        } else {
-            state.router.unregister_writer(ext);
+    {
+        let _update = state.registration_updates.lock().unwrap();
+        let extension = state.remove_connection(&peer_addr);
+        state.registrar.disconnect(peer_addr);
+        if let Some(ext) = &extension {
+            tracing::info!("分机 {} 断开连接", ext);
+            if let Some(writer) = state.find_writer_by_extension(ext) {
+                state.router.register_writer(ext, writer);
+            } else {
+                state.router.unregister_writer(ext);
+            }
         }
     }
 
@@ -445,41 +450,45 @@ async fn process_sip_message(
         }
         match method.as_str() {
             "REGISTER" => {
-                let mut response = state.registrar.handle_register(msg_text, peer_addr);
-                // Log the outcome, never the request or its Authorization credentials.
-                if let Ok(text) = std::str::from_utf8(&response) {
-                    if let Some(status) = parser::extract_status_code(text) {
-                        tracing::info!(peer = %peer_addr, status, "REGISTER 响应（401 为正常认证挑战）");
+                let (mut response, pending_delivery) = {
+                    let _update = state.registration_updates.lock().unwrap();
+                    let response = state.registrar.handle_register(msg_text, peer_addr);
+                    // Log the outcome, never the request or its Authorization credentials.
+                    if let Ok(text) = std::str::from_utf8(&response) {
+                        if let Some(status) = parser::extract_status_code(text) {
+                            tracing::info!(peer = %peer_addr, status, "REGISTER 响应（401 为正常认证挑战）");
+                        }
                     }
-                }
 
-                // 检查是否注册成功（200 OK）
-                let mut pending_delivery: Option<(Arc<Router>, String)> = None;
-                if let Ok(resp_text) = std::str::from_utf8(&response) {
-                    if parser::extract_status_code(resp_text) == Some(200) {
-                        // 提取分机号并关联连接
-                        if let Some(uri) = parser::extract_uri_from_header(msg_text, "To") {
-                            if let Some(ext) = parser::extract_extension(&uri) {
-                                if parser::extract_expires(msg_text) == Some(0) {
-                                    state.router.cleanup_disconnected(&writer_tx);
-                                    state.clear_connection_extension(&peer_addr);
-                                    if let Some(writer) = state.find_writer_by_extension(&ext) {
-                                        state.router.register_writer(&ext, writer);
+                    // 检查是否注册成功（200 OK）
+                    let mut pending_delivery: Option<(Arc<Router>, String)> = None;
+                    if let Ok(resp_text) = std::str::from_utf8(&response) {
+                        if parser::extract_status_code(resp_text) == Some(200) {
+                            // 提取分机号并关联连接
+                            if let Some(uri) = parser::extract_uri_from_header(msg_text, "To") {
+                                if let Some(ext) = parser::extract_extension(&uri) {
+                                    if parser::extract_expires(msg_text) == Some(0) {
+                                        state.router.cleanup_disconnected(&writer_tx);
+                                        state.clear_connection_extension(&peer_addr);
+                                        if let Some(writer) = state.find_writer_by_extension(&ext) {
+                                            state.router.register_writer(&ext, writer);
+                                        } else {
+                                            state.router.unregister_writer(&ext);
+                                        }
+                                        tracing::info!("分机 {} 已显式注销连接 {}", ext, peer_addr);
                                     } else {
-                                        state.router.unregister_writer(&ext);
+                                        state.set_connection_extension(&peer_addr, ext.clone());
+                                        state.router.register_writer(&ext, writer_tx.clone());
+                                        tracing::info!("分机 {} 已关联连接 {}", ext, peer_addr);
+                                        // 注册成功：稍后后台补投该分机的离线即时消息
+                                        pending_delivery = Some((Arc::clone(&state.router), ext));
                                     }
-                                    tracing::info!("分机 {} 已显式注销连接 {}", ext, peer_addr);
-                                } else {
-                                    state.set_connection_extension(&peer_addr, ext.clone());
-                                    state.router.register_writer(&ext, writer_tx.clone());
-                                    tracing::info!("分机 {} 已关联连接 {}", ext, peer_addr);
-                                    // 注册成功：稍后后台补投该分机的离线即时消息
-                                    pending_delivery = Some((Arc::clone(&state.router), ext));
                                 }
                             }
                         }
                     }
-                }
+                    (response, pending_delivery)
+                };
 
                 if let Some((_, ext)) = &pending_delivery {
                     let (id, result) = state
@@ -1098,6 +1107,7 @@ mod tests {
             bark: Arc::new(BarkQueue::default()),
             bark_subscriptions: Arc::new(BarkSubscriptions::memory()),
             connections: RwLock::new(HashMap::new()),
+            registration_updates: Mutex::new(()),
         })
     }
 

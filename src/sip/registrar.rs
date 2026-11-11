@@ -252,7 +252,7 @@ impl RegistrarService {
 
                 if expires == 0 {
                     // 注销
-                    self.unregister(&extension);
+                    self.unregister_from(&extension, from_addr);
                     tracing::info!("分机 {} 已注销", extension);
                     return parser::build_response_with_headers(
                         request_text,
@@ -345,6 +345,18 @@ impl RegistrarService {
             .retain(|_, r| r.transport_addr != peer);
     }
 
+    fn unregister_from(&self, extension: &str, peer: SocketAddr) {
+        let mut registrations = self.registrations.write().unwrap();
+        if registrations
+            .get(extension)
+            .is_some_and(|entry| entry.transport_addr == peer)
+        {
+            registrations.remove(extension);
+            tracing::info!("分机 {} 已注销", extension);
+        }
+    }
+
+    #[cfg(test)]
     /// 注销分机
     pub fn unregister(&self, extension: &str) {
         let mut map = self.registrations.write().unwrap();
@@ -710,6 +722,54 @@ mod tests {
         )
         .unwrap();
         assert!(expired.contains("401 Unauthorized") && expired.contains("stale=true"));
+    }
+
+    #[test]
+    fn delayed_unregister_does_not_remove_reconnected_extension() {
+        let svc = RegistrarService::new(
+            "example.com".into(),
+            "secret".into(),
+            HashMap::new(),
+            1000,
+            2000,
+        );
+        let old = "127.0.0.1:1234".parse().unwrap();
+        let new = "127.0.0.1:1235".parse().unwrap();
+        let mut nonces = Vec::new();
+        for peer in [old, new] {
+            svc.handle_register(&request("", "1001"), peer);
+            let nonce = svc
+                .challenges
+                .read()
+                .unwrap()
+                .iter()
+                .find(|(_, challenge)| challenge.0 == peer)
+                .unwrap()
+                .0
+                .clone();
+            let register = authorized(&nonce, "1001", "1001", "00000001");
+            assert_eq!(
+                parser::extract_status_code(
+                    std::str::from_utf8(&svc.handle_register(&register, peer)).unwrap()
+                ),
+                Some(200)
+            );
+            nonces.push(nonce);
+        }
+        for (peer, nonce) in [(old, &nonces[0]), (new, &nonces[1])] {
+            let unregister = authorized(nonce, "1001", "1001", "00000002")
+                .replace("Content-Length:", "Expires: 0\r\nContent-Length:");
+            assert_eq!(
+                parser::extract_status_code(
+                    std::str::from_utf8(&svc.handle_register(&unregister, peer)).unwrap()
+                ),
+                Some(200)
+            );
+            assert_eq!(
+                svc.lookup("1001").map(|entry| entry.transport_addr),
+                (peer == old).then_some(new)
+            );
+        }
     }
 
     #[test]
