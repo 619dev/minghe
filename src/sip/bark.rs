@@ -44,15 +44,18 @@ impl BarkTarget {
 }
 
 async fn notify(endpoint: &str, key: &str, test: bool) -> bool {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "device_key": key,
         "title": "Minghe",
-        "body": if test { "Bark test succeeded. Tap to open Minghe." } else { "Incoming SIP call. Tap to open Minghe." },
+        "body": if test { "Bark test succeeded." } else { "Incoming SIP call. Tap to open Minghe." },
         "sound": "minuet",
         "level": "timeSensitive",
         "group": "Minghe",
-        "url": "minghe://incoming",
     });
+    if !test {
+        body["url"] = serde_json::json!("minghe://incoming");
+        body["call"] = serde_json::json!("1");
+    }
     // Keep the key out of the process arguments, logs and redirects.
     let Ok(mut child) = tokio::process::Command::new("curl")
         .args([
