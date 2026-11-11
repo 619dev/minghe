@@ -18,3 +18,5 @@ pub mod transaction;
 pub mod e2ee;
 
 mod sdes_router;
+
+pub(crate) mod bark;

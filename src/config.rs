@@ -20,6 +20,8 @@ pub struct AppConfig {
     /// 分机独立密码（可选，覆盖 default_password）
     #[serde(default)]
     pub passwords: HashMap<String, String>,
+    #[serde(default)]
+    pub bark: HashMap<String, crate::sip::bark::BarkTarget>,
 }
 
 /// SIP 服务器基本配置
@@ -119,6 +121,15 @@ impl AppConfig {
                 path
             )
         })?;
+
+        for (extension, target) in &config.bark {
+            if !extension.parse::<u32>().is_ok_and(|ext| {
+                (config.extensions.range_start..=config.extensions.range_end).contains(&ext)
+            }) || !target.valid()
+            {
+                return Err("Bark 配置需要有效分机、HTTPS /push 地址和设备密钥环境变量名".into());
+            }
+        }
 
         if config.tls.cert_path.is_empty() != config.tls.key_path.is_empty() {
             return Err("cert_path 和 key_path 必须同时设置或同时留空".into());

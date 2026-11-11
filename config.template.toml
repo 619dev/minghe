@@ -79,3 +79,8 @@ key_path = ""
 # 1001 = "CHANGE_ME_EXTENSION_1001"
 # 1002 = "CHANGE_ME_EXTENSION_1002"
 # 1003 = "CHANGE_ME_EXTENSION_1003"
+
+# Optional offline call reminders. Export the named variable with the Bark device key.
+# [bark."1002"]
+# endpoint = "https://api.day.app/push"
+# device_key_env = "MINGHE_BARK_1002_KEY"

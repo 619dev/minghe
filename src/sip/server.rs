@@ -12,6 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Semaphore};
 
+use super::bark::{BarkQueue, BarkSubscriptions, Enqueue};
 use super::parser;
 use super::registrar::RegistrarService;
 use super::router::Router;
@@ -35,6 +36,8 @@ pub struct ServerState {
     pub registrar: Arc<RegistrarService>,
     pub router: Arc<Router>,
     pub transaction_mgr: Arc<TransactionManager>,
+    bark: Arc<BarkQueue>,
+    bark_subscriptions: Arc<BarkSubscriptions>,
     /// 连接映射：peer_addr -> ConnectionState
     connections: RwLock<HashMap<SocketAddr, ConnectionState>>,
 }
@@ -134,6 +137,12 @@ pub async fn run(
         registrar,
         router,
         transaction_mgr,
+        bark: Arc::new(BarkQueue::default()),
+        bark_subscriptions: Arc::new(BarkSubscriptions::load(
+            std::env::var_os("MINGHE_BARK_STORE")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("certs/bark-subscriptions.json")),
+        )?),
         connections: RwLock::new(HashMap::new()),
     });
 
@@ -303,6 +312,7 @@ async fn handle_connection(
     }
 
     state.router.cleanup_disconnected(&writer_tx);
+    state.bark.disconnect(&writer_tx);
     // 连接断开，清理
     let extension = state.remove_connection(&peer_addr);
     state.registrar.disconnect(peer_addr);
@@ -367,22 +377,6 @@ async fn process_sip_message(
                     .await;
                 return;
             }
-            if matches!(method.as_str(), "ACK" | "BYE" | "CANCEL")
-                && !state
-                    .router
-                    .authorizes_dialog(msg_text, &writer_tx, &method)
-            {
-                if method != "ACK" {
-                    let _ = writer_tx
-                        .send(parser::build_response(
-                            msg_text,
-                            481,
-                            "Call/Transaction Does Not Exist",
-                        ))
-                        .await;
-                }
-                return;
-            }
         }
         // Offerless calls are unsupported; dialog control cannot carry a second
         // unvalidated offer or accidentally forward SDES/plaintext content.
@@ -395,6 +389,38 @@ async fn process_sip_message(
                         msg_text,
                         415,
                         "Unsupported Media Type",
+                    ))
+                    .await;
+            }
+            return;
+        }
+        if method == "CANCEL" {
+            if let Some(pending) = state.bark.cancel(msg_text, &writer_tx) {
+                let _ = writer_tx
+                    .send(parser::build_response(msg_text, 200, "OK"))
+                    .await;
+                let _ = pending
+                    .caller
+                    .send(parser::build_response(
+                        &pending.request,
+                        487,
+                        "Request Terminated",
+                    ))
+                    .await;
+                return;
+            }
+        }
+        if matches!(method.as_str(), "ACK" | "BYE" | "CANCEL")
+            && !state
+                .router
+                .authorizes_dialog(msg_text, &writer_tx, &method)
+        {
+            if method != "ACK" {
+                let _ = writer_tx
+                    .send(parser::build_response(
+                        msg_text,
+                        481,
+                        "Call/Transaction Does Not Exist",
                     ))
                     .await;
             }
@@ -419,7 +445,7 @@ async fn process_sip_message(
         }
         match method.as_str() {
             "REGISTER" => {
-                let response = state.registrar.handle_register(msg_text, peer_addr);
+                let mut response = state.registrar.handle_register(msg_text, peer_addr);
                 // Log the outcome, never the request or its Authorization credentials.
                 if let Ok(text) = std::str::from_utf8(&response) {
                     if let Some(status) = parser::extract_status_code(text) {
@@ -455,16 +481,103 @@ async fn process_sip_message(
                     }
                 }
 
+                if let Some((_, ext)) = &pending_delivery {
+                    let (id, result) = state
+                        .bark_subscriptions
+                        .register(ext, msg_text, state.config.bark.get(ext))
+                        .await;
+                    // Preserve the registrar's Contact/Expires and authentication headers.
+                    if let Some(end) = response.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        let headers =
+                            format!("\r\nX-Minghe-Bark-ID: {id}\r\nX-Minghe-Bark-State: {result}");
+                        response.splice(end..end, headers.bytes());
+                    }
+                }
+
                 // 先回 200 OK，避免离线补投（最多串行发送 100 条，通道容量有限）
                 // 阻塞注册确认
                 let _ = writer_tx.send(response).await;
                 if let Some((router, ext)) = pending_delivery {
+                    if let Some(pending) = state.bark.take_for_registration(&ext) {
+                        let response = router
+                            .handle_invite(&pending.request, pending.caller.clone())
+                            .await;
+                        let _ = pending.caller.send(response).await;
+                    }
                     tokio::spawn(async move {
                         router.deliver_offline_messages(&ext).await;
                     });
                 }
             }
             "INVITE" => {
+                if let Some(callee) = super::router::extract_called_extension(msg_text) {
+                    if state
+                        .bark_subscriptions
+                        .configured(&callee, state.config.bark.get(&callee))
+                    {
+                        if state.find_writer_by_extension(&callee).is_none()
+                            && parser::extract_body(msg_text).is_some()
+                            && parser::extract_to_tag(msg_text).is_none()
+                        {
+                            let response = match state.bark.enqueue(&callee, msg_text, &writer_tx) {
+                                Enqueue::Queued(deadline) => {
+                                    let _ = writer_tx
+                                        .send(parser::build_response(msg_text, 100, "Trying"))
+                                        .await;
+                                    // Cover registration between checking the connection and adding the INVITE.
+                                    if state.find_writer_by_extension(&callee).is_some() {
+                                        if let Some(pending) =
+                                            state.bark.take_if_current(&callee, deadline)
+                                        {
+                                            let response = state
+                                                .router
+                                                .handle_invite(
+                                                    &pending.request,
+                                                    pending.caller.clone(),
+                                                )
+                                                .await;
+                                            let _ = pending.caller.send(response).await;
+                                        }
+                                        return;
+                                    }
+                                    let state = Arc::clone(&state);
+                                    let queue = Arc::clone(&state.bark);
+                                    tokio::spawn(async move {
+                                        let delivered = state
+                                            .bark_subscriptions
+                                            .notify(&callee, state.config.bark.get(&callee), false)
+                                            .await;
+                                        tracing::info!(extension = %callee, delivered, "Bark call reminder delivery");
+                                        if delivered {
+                                            tokio::time::sleep_until(deadline.into()).await;
+                                        }
+                                        if let Some(pending) =
+                                            queue.take_if_current(&callee, deadline)
+                                        {
+                                            let _ = pending
+                                                .caller
+                                                .send(parser::build_response(
+                                                    &pending.request,
+                                                    480,
+                                                    "Temporarily Unavailable",
+                                                ))
+                                                .await;
+                                        }
+                                    });
+                                    return;
+                                }
+                                Enqueue::Retransmission => {
+                                    parser::build_response(msg_text, 100, "Trying")
+                                }
+                                Enqueue::Rejected => {
+                                    parser::build_response(msg_text, 486, "Busy Here")
+                                }
+                            };
+                            let _ = writer_tx.send(response).await;
+                            return;
+                        }
+                    }
+                }
                 let response = state
                     .router
                     .handle_invite(msg_text, writer_tx.clone())
@@ -982,6 +1095,8 @@ mod tests {
             registrar,
             router,
             transaction_mgr: Arc::new(TransactionManager::new()),
+            bark: Arc::new(BarkQueue::default()),
+            bark_subscriptions: Arc::new(BarkSubscriptions::memory()),
             connections: RwLock::new(HashMap::new()),
         })
     }
@@ -1015,6 +1130,20 @@ mod tests {
             String::new()
         };
         format!("{method} sip:1002@example.com SIP/2.0\r\nFrom: <sip:{from}@example.com>;tag=caller\r\nTo: <sip:1002@example.com>\r\nCall-ID: security-call\r\nCSeq: 1 {method}\r\nContent-Type: application/sdp\r\n{identity}Content-Length: {}\r\n\r\n{body}", body.len())
+    }
+
+    #[tokio::test]
+    async fn bark_setup_requires_successful_digest_registration() {
+        let state = fixture();
+        let peer = "127.0.0.1:1234".parse().unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        state.register_connection(peer, tx.clone());
+        let register = "REGISTER sip:example.com SIP/2.0\r\nVia: SIP/2.0/TLS example.com;branch=z9hG4bK-bark\r\nFrom: <sip:1001@example.com>;tag=bark\r\nTo: <sip:1001@example.com>\r\nContact: <sip:1001@example.com>\r\nCall-ID: bark-test\r\nCSeq: 1 REGISTER\r\nExpires: 300\r\nX-Minghe-Bark-ID: test-1\r\nX-Minghe-Bark-Action: set\r\nX-Minghe-Bark-Endpoint: https://api.day.app/private-key\r\nContent-Length: 0\r\n\r\n";
+        process_sip_message(register, peer, tx, &state).await;
+        let response = String::from_utf8(rx.try_recv().unwrap()).unwrap();
+        assert!(response.contains("401 Unauthorized"));
+        assert!(!response.contains("private-key"));
+        assert!(state.bark_subscriptions.endpoint("1001").is_none());
     }
 
     #[tokio::test]
